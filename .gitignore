@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sensitive API Keys & Configurations
+bitget_keys.py
+*keys*.py
+*.yaml
+*.yml
+*.json
+
+# Trading records & logs
+*.xlsx
+*.log
+
+# Backtest output charts
+*.png
