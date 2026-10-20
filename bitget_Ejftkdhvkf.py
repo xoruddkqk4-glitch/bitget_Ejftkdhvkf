@@ -1175,16 +1175,22 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
     if not sell_orders:
         remaining = 0 if stock_data.empty else len(stock_data[pd.isna(stock_data["매도가"])])
         # 5분 크론탭에서 매 5분마다 텔레그램을 보내면 알림 폭탄이 되므로 매시 51분(정기 브리핑)에만 발송
+        # 단, 2단계 추세추종 차수가 0개인 경우 1시간 단위 정기 메시지 발송 생략
         now_utc = datetime.now(timezone.utc)
         if now_utc.minute == 51:
-            stage2_cnt = sum(1 for r in rounds_dict.values() if r.get("stage") == 2)
-            msg = (
-                f"⏸️ {stock_code} 매도 현황 브리핑 (정기)\n"
-                f"🔹 상태: 목표가 미도달 & 2단계 추세 유지 중\n"
-                f"📈 현재가(LS): {current_price:.2f}\n"
-                f"🧾 미매도 보유 차수: {remaining}개 (2단계 추세추종: {stage2_cnt}개)"
-            )
-            telegram_alert.SendMessage(msg)
+            latest_state = load_round_state()
+            latest_rounds = latest_state.get(stock_code, {}).get("rounds", {})
+            stage2_cnt = sum(1 for r in latest_rounds.values() if r.get("stage") == 2)
+            if stage2_cnt > 0:
+                msg = (
+                    f"⏸️ {stock_code} 매도 현황 브리핑 (정기)\n"
+                    f"🔹 상태: 목표가 미도달 & 2단계 추세 유지 중\n"
+                    f"📈 현재가(LS): {current_price:.2f}\n"
+                    f"🧾 미매도 보유 차수: {remaining}개 (2단계 추세추종: {stage2_cnt}개)"
+                )
+                telegram_alert.SendMessage(msg)
+            else:
+                print(f"⏸️ {stock_code} 매도 없음 (2단계 추세추종 0개로 1시간 정기 브리핑 생략 / 잔여 {remaining}개)")
         else:
             print(f"⏸️ {stock_code} 매도 없음 (목표가 미도달 or 2단계 홀딩 중 / 잔여 {remaining}개)")
 
