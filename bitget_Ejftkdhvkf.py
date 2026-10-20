@@ -46,10 +46,11 @@
 #   반드시 소액으로 충분히 검증한 뒤 사용하세요.
 # =========================================================
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import pprint
 import os
+import json
 
 import telegram_alert
 
@@ -260,6 +261,33 @@ def 체결가_조회(exchange, symbol, order_result, fallback_price, fallback_qt
                     print(f"[fetch_order 최종 실패 {attempt}/{FILL_FETCH_RETRIES}] {e}")
     print(f"⚠️ 체결가 조회 실패 → fallback 사용 (가격={fallback_price}, 수량={fallback_qty})")
     return float(fallback_price), float(fallback_qty), float(fallback_price) * float(fallback_qty)
+
+def get_4h_ma5_status(exchange, symbol):
+    """
+    비트겟 무기한선물 4시간봉 기준 직전 '완성봉(index -2)'의 종가가 5MA 아래로 꺾였는지 판정.
+    반환: (is_broken, prev_close, ma5)
+    """
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="4h", limit=10)
+        if not ohlcv or len(ohlcv) < 7:
+            print(f"[4h 5MA] 데이터 부족 ({len(ohlcv) if ohlcv else 0}개 수신)")
+            return False, 0.0, 0.0
+
+        df_4h = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_4h["close"] = pd.to_numeric(df_4h["close"], errors="coerce")
+
+        # index -1 은 현재 실시간 진행 중인 미완성 캔들이므로 직전 완성봉(index -2) 기준 판정
+        # 직전 완성봉 포함 최근 5개 완성봉 구간: iloc[-6:-1]
+        completed_5 = df_4h["close"].iloc[-6:-1]
+        ma5 = float(completed_5.mean())
+        prev_close = float(df_4h["close"].iloc[-2])
+
+        is_broken = prev_close < ma5
+        print(f"[4h 5MA 분석] 직전완성봉 종가={prev_close:.4f}, 5MA={ma5:.4f}, 꺾임(이탈)={is_broken}")
+        return is_broken, prev_close, ma5
+    except Exception as e:
+        print(f"[4h 5MA 조회 에러] {e}")
+        return False, 0.0, 0.0
 # ===== Bitget 인프라 끝 =====
 
 from openpyxl import load_workbook
@@ -286,6 +314,95 @@ telegram_alert.SendMessage = _prefixed_send
 FILENAME = "/var/autobot/bitget_Ejftkdhvkf/비트겟떨사오팔_매매기록.xlsx"
 # PC에서 테스트할 때는 아래를 사용하세요
 # FILENAME = "./비트겟떨사오팔_매매기록.xlsx"
+
+# 차수별 2단계 상태 파일 이름
+ROUND_STATE_FILE = os.path.join(os.path.dirname(FILENAME), "bitget_round_state.json") if os.path.dirname(FILENAME) else "./bitget_round_state.json"
+
+# =========================
+# ✅ 차수별 2단계 상태 관리 (JSON 기반 + 엑셀 동기화)
+# =========================
+def load_round_state():
+    if not os.path.exists(ROUND_STATE_FILE):
+        return {}
+    try:
+        with open(ROUND_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[상태파일 로드 실패] {e}")
+        return {}
+
+def save_round_state(state):
+    try:
+        d = os.path.dirname(ROUND_STATE_FILE)
+        if d and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+        with open(ROUND_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[상태파일 저장 실패] {e}")
+
+def sync_round_state_from_excel(df, stock_code):
+    """
+    상태 파일이 비어있거나 특정 차수가 누락된 경우,
+    엑셀 매매기록의 미매도 차수들을 읽어 자동으로 stage=1 로 복원/동기화(Self-healing).
+    """
+    state = load_round_state()
+    stock_dict = state.setdefault(stock_code, {})
+    rounds = stock_dict.setdefault("rounds", {})
+
+    if df is not None and not df.empty and "종목" in df.columns:
+        stock_data = df[df["종목"] == stock_code]
+        for _, row in stock_data.iterrows():
+            if pd.notna(row.get("매도가", None)):
+                r_key = str(int(row["차수"]))
+                rounds.pop(r_key, None)
+                continue
+
+            r_key = str(int(row["차수"]))
+            buy_price = float(row["매수가"])
+            qty = float(row["수량"])
+            target_price = buy_price * (1.0 + SELL_PROFIT_PCT)
+
+            if r_key not in rounds:
+                rounds[r_key] = {
+                    "stage": 1,
+                    "buy_price": buy_price,
+                    "quantity": qty,
+                    "target_price": target_price,
+                    "preservation_line": target_price,
+                    "stage2_entered_at": None,
+                }
+    save_round_state(state)
+    return state
+
+def update_round_stage(stock_code, round_number, stage, preservation_line=None, target_price=None, buy_price=None, quantity=None):
+    state = load_round_state()
+    rounds = state.setdefault(stock_code, {}).setdefault("rounds", {})
+    r_key = str(int(round_number))
+    r_info = rounds.setdefault(r_key, {})
+
+    r_info["stage"] = int(stage)
+    if preservation_line is not None:
+        r_info["preservation_line"] = float(preservation_line)
+    if target_price is not None:
+        r_info["target_price"] = float(target_price)
+    if buy_price is not None:
+        r_info["buy_price"] = float(buy_price)
+    if quantity is not None:
+        r_info["quantity"] = float(quantity)
+    if stage == 2 and not r_info.get("stage2_entered_at"):
+        r_info["stage2_entered_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    save_round_state(state)
+    return r_info
+
+def remove_round_from_state(stock_code, round_number):
+    state = load_round_state()
+    r_key = str(int(round_number))
+    if stock_code in state and "rounds" in state[stock_code]:
+        if r_key in state[stock_code]["rounds"]:
+            del state[stock_code]["rounds"][r_key]
+            save_round_state(state)
 
 
 # =========================
@@ -887,9 +1004,16 @@ def 가능다음차수(stock_data):
 # ✅ 매도 체크
 #    데이터=LS / 주문=LS
 # =========================
+# =========================
+# ✅ 매도 체크 (2단계 추세 추종 & 보존선 방어)
+#    데이터=LS / 주문=Bitget 선물
+# =========================
 def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None):
     df = 매매기록불러오기()
     stock_data = df[df["종목"] == stock_code]
+
+    # 상태 파일 동기화 (기존 엑셀 미매도건 자동 복원)
+    state = sync_round_state_from_excel(df, stock_code)
 
     # ✅ 현재가 데이터는 LS
     current_price = LsiUS.GetCurrentPrice(stock_code)
@@ -899,6 +1023,15 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
     current_invest_money = 투자금시트_초기화_및_불러오기(stock_code, default_invest_money)
     highest_price_30d = 과거_고점찾기(stock_code, ohlcv)
 
+    # 미매도 차수 중 2단계(추세추종) 진입 차수가 있으면 4시간봉 5MA 지표 사전 조회
+    rounds_dict = state.get(stock_code, {}).get("rounds", {})
+    has_stage2 = any(r.get("stage") == 2 for r in rounds_dict.values())
+    is_ma5_broken = False
+    prev_close_4h = 0.0
+    ma5_4h = 0.0
+    if has_stage2:
+        is_ma5_broken, prev_close_4h, ma5_4h = get_4h_ma5_status(exchange, symbol)
+
     for index, row in stock_data.iterrows():
         if pd.notna(row.get("매도가", None)):
             continue
@@ -907,24 +1040,26 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
             if isinstance(row["날짜"], pd.Timestamp):
                 buy_date = row["날짜"].date()
             else:
-                buy_date = datetime.strptime(row["날짜"], "%Y-%m-%d").date()
+                buy_date = datetime.strptime(str(row["날짜"])[:10], "%Y-%m-%d").date()
         except ValueError:
             print(f"날짜 형식 오류: {row['날짜']}")
             continue
 
-        buy_price = row["매수가"]
-        quantity = row["수량"]
-        round_number = row["차수"]
+        buy_price = float(row["매수가"])
+        quantity = float(row["수량"])
+        round_number = int(row["차수"])
         target_price = buy_price * (1.0 + SELL_PROFIT_PCT)
         max_hold_days = MAX_HOLD_DAYS_HIGH_DROP if row["고점대비하락조건"] else MAX_HOLD_DAYS_NORMAL
 
-        if current_price >= target_price:
-            print(f"{stock_code} {round_number}차 떨사오팔 매도 조건 만족 - 현재가: {current_price}, 목표가: {target_price}")
-            sell_orders.append((index, quantity, current_price * 0.98, f"목표가 도달(매수가 +{SELL_PROFIT_PCT*100:.1f}%)", buy_price, buy_date))
+        r_key = str(round_number)
+        r_info = rounds_dict.get(r_key, {})
+        current_stage = r_info.get("stage", 1)
+        preservation_line = float(r_info.get("preservation_line", target_price))
 
-        elif (today - buy_date).days >= max_hold_days:
+        # 1) 타임컷 우선 체크
+        if (today - buy_date).days >= max_hold_days:
             print(f"{stock_code} {round_number}차 떨사오팔 강제 매도 - {max_hold_days}일 경과")
-            sell_orders.append((index, quantity, current_price * 0.98, f"보유기간 경과({max_hold_days}일)", buy_price, buy_date))
+            sell_orders.append((index, quantity, current_price * 0.98, f"보유기간 경과({max_hold_days}일)", buy_price, buy_date, round_number))
 
             msg = (
                 f"⚠️ 떨사오팔 일반 전략 {stock_code} {round_number}차 강제 매도 알림\n"
@@ -933,8 +1068,39 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
                 f"📊 보유 수량: {quantity}주\n"
             )
             telegram_alert.SendMessage(msg)
+            continue
 
-    for index, quantity, sell_price, sell_reason, buy_price, buy_date in sell_orders:
+        # 2) 1단계: 1차 목표가 감시
+        if current_stage == 1:
+            if current_price >= target_price:
+                update_round_stage(stock_code, round_number, stage=2, preservation_line=target_price, target_price=target_price, buy_price=buy_price, quantity=quantity)
+                print(f"{stock_code} {round_number}차 1차 목표가 돌파 -> 2단계(추세추종) 승격!")
+                msg = (
+                    f"🎯 [1차 목표가 돌파] {stock_code} {round_number}차 2단계 승격\n"
+                    f"🔹 진입 단계: [2단계 추세 추종 모드]\n"
+                    f"📈 1차 목표가: {target_price:.2f} (수익률 +{SELL_PROFIT_PCT*100:.1f}%)\n"
+                    f"💲 현재가: {current_price:.2f}\n"
+                    f"🛡️ 최소 이익 보존선: {target_price:.2f}\n"
+                    f"💡 4시간봉 5MA 꺾임 시 초과 익절 또는 보존선 하향 터치(0.998) 시 즉시 방어 매도합니다."
+                )
+                telegram_alert.SendMessage(msg)
+            else:
+                print(f"{stock_code} {round_number}차 1단계 감시 중: 현재가 {current_price:.2f} < 목표가 {target_price:.2f}")
+
+        # 3) 2단계: 추세추종 (시나리오 ② 보존선 방어 or 시나리오 ① 4h 5MA 이탈)
+        elif current_stage == 2:
+            # 시나리오 ②: 최소 이익 보존선 방어 매도 (현재가 <= 보존선 * 0.998)
+            if current_price <= preservation_line * 0.998:
+                print(f"{stock_code} {round_number}차 보존선 방어 매도 조건 충족: 현재가 {current_price:.2f} <= {preservation_line * 0.998:.2f}")
+                sell_orders.append((index, quantity, current_price * 0.98, f"최소 이익 보존선 방어(보존선 {preservation_line:.2f} 대비 하향 터치)", buy_price, buy_date, round_number))
+            # 시나리오 ①: 추세 꺾임 익절 (4시간봉 5MA 이탈)
+            elif is_ma5_broken:
+                print(f"{stock_code} {round_number}차 추세 꺾임 익절 조건 충족: 4시간봉 종가 {prev_close_4h:.2f} < 5MA {ma5_4h:.2f}")
+                sell_orders.append((index, quantity, current_price * 0.98, f"추세 꺾임 익절(4시간봉 완성봉 {prev_close_4h:.2f} < 5MA {ma5_4h:.2f})", buy_price, buy_date, round_number))
+            else:
+                print(f"{stock_code} {round_number}차 2단계 홀딩 중 (현재가 {current_price:.2f} > 보존선 {preservation_line:.2f}, 4h 5MA 상승 추세 유지)")
+
+    for index, quantity, sell_price, sell_reason, buy_price, buy_date, round_number in sell_orders:
         # ✅ 주문은 Bitget 선물 (청산), 엑셀엔 실체결값 저장
         order, order_price = place_close_long(exchange, symbol, quantity)
         print("[매도주문]", order)
@@ -983,6 +1149,9 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
         투자금시트_업데이트(stock_code, next_invest_money, profit_pct, adj_pct)
         current_invest_money = next_invest_money
 
+        # 상태 파일에서 해당 차수 제거
+        remove_round_from_state(stock_code, round_number)
+
         drop_rate = 0.0
         if highest_price_30d and highest_price_30d > 0:
             drop_rate = (highest_price_30d - current_price) / highest_price_30d * 100.0
@@ -1005,13 +1174,19 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
 
     if not sell_orders:
         remaining = 0 if stock_data.empty else len(stock_data[pd.isna(stock_data["매도가"])])
-        msg = (
-            f"⏸️ {stock_code} 매도 없음\n"
-            f"🔹 이유: 목표가 미도달 & 보유기간 미경과\n"
-            f"📈 현재가(LS): {current_price:.2f}\n"
-            f"🧾 미매도 보유 차수: {remaining}개"
-        )
-        telegram_alert.SendMessage(msg)
+        # 5분 크론탭에서 매 5분마다 텔레그램을 보내면 알림 폭탄이 되므로 매시 51분(정기 브리핑)에만 발송
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.minute == 51:
+            stage2_cnt = sum(1 for r in rounds_dict.values() if r.get("stage") == 2)
+            msg = (
+                f"⏸️ {stock_code} 매도 현황 브리핑 (정기)\n"
+                f"🔹 상태: 목표가 미도달 & 2단계 추세 유지 중\n"
+                f"📈 현재가(LS): {current_price:.2f}\n"
+                f"🧾 미매도 보유 차수: {remaining}개 (2단계 추세추종: {stage2_cnt}개)"
+            )
+            telegram_alert.SendMessage(msg)
+        else:
+            print(f"⏸️ {stock_code} 매도 없음 (목표가 미도달 or 2단계 홀딩 중 / 잔여 {remaining}개)")
 
     매매기록저장(df)
     return sell_orders
@@ -1038,16 +1213,38 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
 
     df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
     매매기록저장(df)
-    print(f"{stock_code} {round_number}차 매수 기록 완료 - 매수가: {buy_price}, 수량: {quantity}, 고점대비하락조건: {high_drop_condition}")
+
+    # 차수별 상태 파일 등록 (새로운 매수는 1단계로 진입)
+    target_price = float(buy_price) * (1.0 + SELL_PROFIT_PCT)
+    update_round_stage(
+        stock_code,
+        round_number,
+        stage=1,
+        preservation_line=target_price,
+        target_price=target_price,
+        buy_price=float(buy_price),
+        quantity=float(quantity)
+    )
+    print(f"{stock_code} {round_number}차 매수 기록 및 상태(1단계) 등록 완료 - 매수가: {buy_price}, 수량: {quantity}, 고점대비하락조건: {high_drop_condition}")
 
 
 # =========================
 # ✅ 매수 체크
-#    데이터=LS / 주문=LS
+#    데이터=LS / 주문=Bitget 선물
 # =========================
 def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None):
     df = 매매기록불러오기()
     stock_data = df[df["종목"] == stock_code]
+
+    # ✅ 당일(KST 기준) 이미 매수한 이력이 있는지 사전 점검 (5분 크론탭 급락 시 연속 매수 원천 차단)
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    if not stock_data.empty and "날짜" in stock_data.columns:
+        bought_today = stock_data[stock_data["날짜"].astype(str).str.startswith(today_str)]
+        if not bought_today.empty:
+            rounds_bought = bought_today["차수"].tolist()
+            print(f"⏸️ [당일 매수 완료] {stock_code}는 오늘({today_str}) 이미 {rounds_bought}차 매수가 완료되었습니다. (추가 매수 차단)")
+            return False
+
     next_round = 가능다음차수(stock_data) if not stock_data.empty else 1
 
     invest_money = 투자금시트_초기화_및_불러오기(stock_code, default_invest_money)
@@ -1165,12 +1362,23 @@ def 매수매도프로세스(exchange, symbol, stock_code, default_invest_money)
     # ✅ OHLCV 데이터는 LS
     ohlcv = LsCommon.GetOhlcv("US", stock_code)
 
+    # 1. [상시 매도 감시] : 5분마다 24시간 항상 실행
     매도_발생 = 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv)
     if 매도_발생:
-        print("매도 완료. 매수 조건 체크를 위해 10초 대기 중...")
+        print("매도 완료. 계좌 정리 대기를 위해 10초 대기 중...")
         time.sleep(10)
 
-    매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv)
+    # 2. [일일 매수 체크] : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴에만 실행!
+    now_utc = datetime.now(timezone.utc)
+    is_weekday = now_utc.weekday() < 5                 # 월~금 (0~4)
+    is_buy_minute = (now_utc.hour == 19 and now_utc.minute == 51)  # 19시 51분
+    force_buy = os.environ.get("FORCE_BUY_CHECK", "0") == "1"
+
+    if (is_weekday and is_buy_minute) or force_buy:
+        print(f"[일일 매수 실행] 평일 19:51 UTC (현재: {now_utc.strftime('%H:%M:%S')} UTC) 매수 조건을 점검합니다.")
+        매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv)
+    else:
+        print(f"[매수 스킵] 현재 시각({now_utc.strftime('%H:%M')} UTC)은 매수 시간(평일 19:51 UTC)이 아니므로 매수를 건너뜁니다.")
 
 
 def 전략_1회실행():
@@ -1215,4 +1423,5 @@ def 전략_재실행_루프():
     print(f"[전략 종료] 최대 대기 시간 초과 - 마지막 오류: {last_err}")
 
 
-전략_재실행_루프()
+if __name__ == "__main__":
+    전략_재실행_루프()
