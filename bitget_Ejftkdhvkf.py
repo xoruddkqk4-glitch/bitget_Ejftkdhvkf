@@ -347,6 +347,7 @@ def sync_round_state_from_excel(df, stock_code):
     """
     상태 파일이 비어있거나 특정 차수가 누락된 경우,
     엑셀 매매기록의 미매도 차수들을 읽어 자동으로 stage=1 로 복원/동기화(Self-healing).
+    이미 stage=2 로 승격된 차수의 상태는 절대 덮어쓰거나 리셋하지 않고 보존합니다.
     """
     state = load_round_state()
     stock_dict = state.setdefault(stock_code, {})
@@ -354,13 +355,14 @@ def sync_round_state_from_excel(df, stock_code):
 
     if df is not None and not df.empty and "종목" in df.columns:
         stock_data = df[df["종목"] == stock_code]
-        for _, row in stock_data.iterrows():
-            if pd.notna(row.get("매도가", None)):
-                r_key = str(int(row["차수"]))
-                rounds.pop(r_key, None)
-                continue
 
+        # 1. 미매도 상태인 행(매도가가 없는 행)만 추출하여 활성 차수 집합 구성
+        active_rows = stock_data[stock_data["매도가"].isna()]
+        active_keys = set()
+
+        for _, row in active_rows.iterrows():
             r_key = str(int(row["차수"]))
+            active_keys.add(r_key)
             buy_price = float(row["매수가"])
             qty = float(row["수량"])
             target_price = buy_price * (1.0 + SELL_PROFIT_PCT)
@@ -374,6 +376,22 @@ def sync_round_state_from_excel(df, stock_code):
                     "preservation_line": target_price,
                     "stage2_entered_at": None,
                 }
+            else:
+                # 기존 차수의 stage, preservation_line, stage2_entered_at 등은 보존하고,
+                # 최신 매수가, 수량, 목표가 메타정보만 업데이트
+                rounds[r_key]["buy_price"] = buy_price
+                rounds[r_key]["quantity"] = qty
+                rounds[r_key]["target_price"] = target_price
+                if "stage" not in rounds[r_key]:
+                    rounds[r_key]["stage"] = 1
+                if "preservation_line" not in rounds[r_key]:
+                    rounds[r_key]["preservation_line"] = target_price
+
+        # 2. 현재 미매도 목록에 없는(이미 전량 매도 완료된) 과거 차수는 rounds에서 안전하게 정리
+        for r_key in list(rounds.keys()):
+            if r_key not in active_keys:
+                rounds.pop(r_key, None)
+
     save_round_state(state)
     return state
 
@@ -1083,7 +1101,8 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
         # 2) 1단계: 1차 목표가 감시
         if current_stage == 1:
             if current_price >= target_price:
-                update_round_stage(stock_code, round_number, stage=2, preservation_line=target_price, target_price=target_price, buy_price=buy_price, quantity=quantity)
+                updated_info = update_round_stage(stock_code, round_number, stage=2, preservation_line=target_price, target_price=target_price, buy_price=buy_price, quantity=quantity)
+                rounds_dict[r_key] = updated_info
                 print(f"{stock_code} {round_number}차 1차 목표가 돌파 -> 2단계(추세추종) 승격!")
                 msg = (
                     f"🎯 [1차 목표가 돌파] {stock_code} {round_number}차 2단계 승격\n"
