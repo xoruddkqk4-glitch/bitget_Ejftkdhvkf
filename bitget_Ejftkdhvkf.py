@@ -262,31 +262,33 @@ def 체결가_조회(exchange, symbol, order_result, fallback_price, fallback_qt
     print(f"⚠️ 체결가 조회 실패 → fallback 사용 (가격={fallback_price}, 수량={fallback_qty})")
     return float(fallback_price), float(fallback_qty), float(fallback_price) * float(fallback_qty)
 
-def get_4h_ma5_status(exchange, symbol):
+def get_trend_ma_status(exchange, symbol):
     """
-    비트겟 무기한선물 4시간봉 기준 직전 '완성봉(index -2)'의 종가가 5MA 아래로 꺾였는지 판정.
-    반환: (is_broken, prev_close, ma5)
+    비트겟 무기한선물 TREND_TIMEFRAME봉 기준
+    직전 '완성봉(index -2)'의 종가가 TREND_MA_PERIOD MA 아래로 꺾였는지 판정.
+    반환: (is_broken, prev_close, ma_val)
     """
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="4h", limit=10)
-        if not ohlcv or len(ohlcv) < 7:
-            print(f"[4h 5MA] 데이터 부족 ({len(ohlcv) if ohlcv else 0}개 수신)")
+        min_candles = TREND_MA_PERIOD + 2
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TREND_TIMEFRAME, limit=TREND_OHLCV_LIMIT)
+        if not ohlcv or len(ohlcv) < min_candles:
+            print(f"[{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA] 데이터 부족 ({len(ohlcv) if ohlcv else 0}개 수신, 최소 {min_candles}개 필요)")
             return False, 0.0, 0.0
 
         df_4h = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df_4h["close"] = pd.to_numeric(df_4h["close"], errors="coerce")
 
         # index -1 은 현재 실시간 진행 중인 미완성 캔들이므로 직전 완성봉(index -2) 기준 판정
-        # 직전 완성봉 포함 최근 5개 완성봉 구간: iloc[-6:-1]
-        completed_5 = df_4h["close"].iloc[-6:-1]
-        ma5 = float(completed_5.mean())
+        # 직전 완성봉 포함 최근 TREND_MA_PERIOD개 완성봉 구간
+        completed_n = df_4h["close"].iloc[-(TREND_MA_PERIOD + 1):-1]
+        ma_val = float(completed_n.mean())
         prev_close = float(df_4h["close"].iloc[-2])
 
-        is_broken = prev_close < ma5
-        print(f"[4h 5MA 분석] 직전완성봉 종가={prev_close:.4f}, 5MA={ma5:.4f}, 꺾임(이탈)={is_broken}")
-        return is_broken, prev_close, ma5
+        is_broken = prev_close < ma_val
+        print(f"[{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 분석] 직전완성봉 종가={prev_close:.4f}, {TREND_MA_PERIOD}MA={ma_val:.4f}, 꺾임(이탈)={is_broken}")
+        return is_broken, prev_close, ma_val
     except Exception as e:
-        print(f"[4h 5MA 조회 에러] {e}")
+        print(f"[{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 조회 에러] {e}")
         return False, 0.0, 0.0
 # ===== Bitget 인프라 끝 =====
 
@@ -436,6 +438,14 @@ HIGH_DROP_ADJ_WEIGHT = 1.5          # 하락시 복리 조정 가중치 (2026-08
 ADJ_DIVISOR = 7.0
 
 SELL_FEE_RATE = 0.0006  # 0.06%
+
+# =========================
+# ✅ 2단계 추세추종 설정 (상승 추세 판정 기준)
+# =========================
+TREND_TIMEFRAME = "4h"               # 추세 판정 캔들 시간프레임 (예: "1h", "4h", "1d")
+TREND_MA_PERIOD = 5                  # 이동평균선 기간 (예: 5 → 5MA, 10 → 10MA)
+TREND_OHLCV_LIMIT = 10               # 추세 판정용 OHLCV 조회 캔들 수
+PRESERVATION_LINE_MULTIPLIER = 0.998  # 보존선 방어 매도 계수 (현재가 ≤ 보존선 × 이 값이면 매도)
 
 # =========================
 # ✅ 데이터 재시도 설정
@@ -1030,7 +1040,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
     prev_close_4h = 0.0
     ma5_4h = 0.0
     if has_stage2:
-        is_ma5_broken, prev_close_4h, ma5_4h = get_4h_ma5_status(exchange, symbol)
+        is_ma5_broken, prev_close_4h, ma5_4h = get_trend_ma_status(exchange, symbol)
 
     for index, row in stock_data.iterrows():
         if pd.notna(row.get("매도가", None)):
@@ -1081,7 +1091,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
                     f"📈 1차 목표가: {target_price:.2f} (수익률 +{SELL_PROFIT_PCT*100:.1f}%)\n"
                     f"💲 현재가: {current_price:.2f}\n"
                     f"🛡️ 최소 이익 보존선: {target_price:.2f}\n"
-                    f"💡 4시간봉 5MA 꺾임 시 초과 익절 또는 보존선 하향 터치(0.998) 시 즉시 방어 매도합니다."
+                    f"💡 {TREND_TIMEFRAME}봉 {TREND_MA_PERIOD}MA 꺾임 시 초과 익절 또는 보존선 하향 터치({PRESERVATION_LINE_MULTIPLIER}) 시 즉시 방어 매도합니다."
                 )
                 telegram_alert.SendMessage(msg)
             else:
@@ -1090,15 +1100,15 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
         # 3) 2단계: 추세추종 (시나리오 ② 보존선 방어 or 시나리오 ① 4h 5MA 이탈)
         elif current_stage == 2:
             # 시나리오 ②: 최소 이익 보존선 방어 매도 (현재가 <= 보존선 * 0.998)
-            if current_price <= preservation_line * 0.998:
-                print(f"{stock_code} {round_number}차 보존선 방어 매도 조건 충족: 현재가 {current_price:.2f} <= {preservation_line * 0.998:.2f}")
-                sell_orders.append((index, quantity, current_price * 0.98, f"최소 이익 보존선 방어(보존선 {preservation_line:.2f} 대비 하향 터치)", buy_price, buy_date, round_number))
+            if current_price <= preservation_line * PRESERVATION_LINE_MULTIPLIER:
+                print(f"{stock_code} {round_number}차 보존선 방어 매도 조건 충족: 현재가 {current_price:.2f} <= {preservation_line * PRESERVATION_LINE_MULTIPLIER:.2f}")
+                sell_orders.append((index, quantity, current_price * 0.98, f"최소 이익 보존선 방어(보존선 {preservation_line:.2f} × {PRESERVATION_LINE_MULTIPLIER} 대비 하향 터치)", buy_price, buy_date, round_number))
             # 시나리오 ①: 추세 꺾임 익절 (4시간봉 5MA 이탈)
             elif is_ma5_broken:
                 print(f"{stock_code} {round_number}차 추세 꺾임 익절 조건 충족: 4시간봉 종가 {prev_close_4h:.2f} < 5MA {ma5_4h:.2f}")
                 sell_orders.append((index, quantity, current_price * 0.98, f"추세 꺾임 익절(4시간봉 완성봉 {prev_close_4h:.2f} < 5MA {ma5_4h:.2f})", buy_price, buy_date, round_number))
             else:
-                print(f"{stock_code} {round_number}차 2단계 홀딩 중 (현재가 {current_price:.2f} > 보존선 {preservation_line:.2f}, 4h 5MA 상승 추세 유지)")
+                print(f"{stock_code} {round_number}차 2단계 홀딩 중 (현재가 {current_price:.2f} > 보존선 {preservation_line:.2f}, {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 상승 추세 유지)")
 
     for index, quantity, sell_price, sell_reason, buy_price, buy_date, round_number in sell_orders:
         # ✅ 주문은 Bitget 선물 (청산), 엑셀엔 실체결값 저장
