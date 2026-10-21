@@ -1036,7 +1036,7 @@ def 가능다음차수(stock_data):
 # ✅ 매도 체크 (2단계 추세 추종 & 보존선 방어)
 #    데이터=LS / 주문=Bitget 선물
 # =========================
-def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None):
+def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None, is_daily_buy_turn=False):
     df = 매매기록불러오기()
     stock_data = df[df["종목"] == stock_code]
 
@@ -1206,10 +1206,31 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
 
     if not sell_orders:
         remaining = 0 if stock_data.empty else len(stock_data[pd.isna(stock_data["매도가"])])
-        # 5분 크론탭에서 매 5분마다 텔레그램을 보내면 알림 폭탄이 되므로 매시 51분(정기 브리핑)에만 발송
-        # 단, 2단계 추세추종 차수가 0개인 경우 1시간 단위 정기 메시지 발송 생략
         now_utc = datetime.now(timezone.utc)
-        if now_utc.minute == 51:
+
+        # 1) 매일 1회 일일 매수 점검 턴 (평일 19:51 UTC 또는 force_buy):
+        #    사용자 요청에 따라 매도 점검 결과(매도 없음)와 매수 결과를 순차적으로 항상 전송
+        if is_daily_buy_turn:
+            # 매수 메시지와 일관성을 위해 가능하면 LS 현재가 조회 시도, 실패 시 선물 현재가 사용
+            disp_price = current_price
+            try:
+                ls_curr = LsiUS.GetCurrentPrice(stock_code)
+                if ls_curr is not None and not _값이_비정상(ls_curr):
+                    disp_price = float(ls_curr)
+            except Exception:
+                pass
+
+            msg = (
+                f"⏸️ {stock_code} 매도 없음\n"
+                f"🔹 이유: 목표가 미도달 & 보유기간 미경과\n"
+                f"📈 현재가(LS): {disp_price:.2f}\n"
+                f"🧾 미매도 보유 차수: {remaining}개"
+            )
+            telegram_alert.SendMessage(msg)
+            print(f"[매도 점검] {stock_code} 매도 없음 알림 발송 (일일 매수 점검 턴 / 잔여 {remaining}개)")
+        # 2) 그 외 일반 시간대의 매시 51분 (정기 브리핑):
+        #    알림 피로도 최적화를 위해 2단계 추세추종 차수가 1개 이상 존재할 때만 발송
+        elif now_utc.minute == 51:
             latest_state = load_round_state()
             latest_rounds = latest_state.get(stock_code, {}).get("rounds", {})
             stage2_cnt = sum(1 for r in latest_rounds.values() if r.get("stage") == 2)
@@ -1222,9 +1243,9 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
                 )
                 telegram_alert.SendMessage(msg)
             else:
-                print(f"⏸️ {stock_code} 매도 없음 (2단계 추세추종 0개로 1시간 정기 브리핑 생략 / 잔여 {remaining}개)")
+                print(f"[매도 없음] {stock_code} (2단계 추세추종 0개로 1시간 정기 브리핑 생략 / 잔여 {remaining}개)")
         else:
-            print(f"⏸️ {stock_code} 매도 없음 (목표가 미도달 or 2단계 홀딩 중 / 잔여 {remaining}개)")
+            print(f"[매도 없음] {stock_code} (목표가 미도달 or 2단계 홀딩 중 / 잔여 {remaining}개)")
 
     매매기록저장(df)
     return sell_orders
@@ -1400,19 +1421,25 @@ def 매수매도프로세스(exchange, symbol, stock_code, default_invest_money)
     # ✅ OHLCV 데이터는 LS
     ohlcv = LsCommon.GetOhlcv("US", stock_code)
 
-    # 1. [상시 매도 감시] : 5분마다 24시간 항상 실행
-    매도_발생 = 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv)
-    if 매도_발생:
-        print("매도 완료. 계좌 정리 대기를 위해 10초 대기 중...")
-        time.sleep(10)
-
-    # 2. [일일 매수 체크] : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴에만 실행!
+    # 1. 일일 매수 체크 시점 판별 : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴
     now_utc = datetime.now(timezone.utc)
     is_weekday = now_utc.weekday() < 5                 # 월~금 (0~4)
     is_buy_minute = (now_utc.hour == 19 and now_utc.minute == 51)  # 19시 51분
     force_buy = os.environ.get("FORCE_BUY_CHECK", "0") == "1"
+    is_daily_buy_turn = (is_weekday and is_buy_minute) or force_buy
 
-    if (is_weekday and is_buy_minute) or force_buy:
+    # 2. [상시 매도 감시] : 5분마다 24시간 항상 실행
+    #    일일 매수 턴인 경우, 매도가 없어도 "매도 없음" 메시지를 발송하도록 플래그 전달
+    매도_발생 = 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv, is_daily_buy_turn=is_daily_buy_turn)
+    if 매도_발생:
+        print("매도 완료. 계좌 정리 대기를 위해 10초 대기 중...")
+        time.sleep(10)
+    elif is_daily_buy_turn:
+        # 매도 메시지와 매수 메시지 순차 전송 시 텔레그램 수신 순서 보장을 위해 2초 대기
+        time.sleep(2)
+
+    # 3. [일일 매수 체크] : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴에만 실행!
+    if is_daily_buy_turn:
         print(f"[일일 매수 실행] 평일 19:51 UTC (현재: {now_utc.strftime('%H:%M:%S')} UTC) 매수 조건을 점검합니다.")
         매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv)
     else:
