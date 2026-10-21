@@ -1043,8 +1043,11 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
     # 상태 파일 동기화 (기존 엑셀 미매도건 자동 복원)
     state = sync_round_state_from_excel(df, stock_code)
 
-    # ✅ 현재가 데이터는 LS
-    current_price = LsiUS.GetCurrentPrice(stock_code)
+    # ✅ 매도 감시 현재가는 Bitget 실시간 선물 시세 사용
+    # (LS증권은 한국 장외 시간대 전산 리셋 시 전일 종가로 초기화되는 왜곡이 발생하여
+    #  24시간 크론탭 기반 매도 감시에서 잘못된 청산을 유발할 수 있음.
+    #  Bitget 선물은 24/7 연속 실시간 시세를 제공하므로 장외 시간대에도 안전함.)
+    current_price = get_current_futures_price(exchange, symbol)
     today = datetime.now(KST).date()
     sell_orders = []
 
