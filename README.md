@@ -137,4 +137,23 @@
   - `python -m py_compile bitget_Ejftkdhvkf.py` 구문 검사 정상 통과
   - 일일 매수 점검 턴 모의 테스트: `⏸️ SOXL 매도 없음` 메시지 발송 및 매수 점검 연계 동작 정상 검증 완료
 
+## [2026-10-22 21:40] 업데이트 이력 (Commit ID: TBD)
+- **요청 사항**:
+  - 떨사오팔 봇의 매수 및 매도 체결 내역을 통합 대시보드 및 구글 스프레드시트(Google Sheets)에 실시간으로 자동 기록할 수 있도록 웹훅 로거(`SheetsLogger`) 연동
+- **수정 내용**:
+  - **구글 스프레드시트 로거 연동 (`sheets_logger.py`)**:
+    - GAS(Google Apps Script) 웹훅 엔드포인트와 통신하는 비동기/안전 전송 모듈(`sheets_logger.py`) 추가
+    - `bitget_Ejftkdhvkf.py` 상단에 `SheetsLogger` 인스턴스 초기화 (`webhook_url`, `auth_token="trading_secret_2026"`, `strategy_name="떨사오팔"`, `exchange="Bitget"`)
+  - **매도 체결 로깅 추가**:
+    - `매도체크()` 내 매도 주문 성공 및 텔레그램 메시지 발송 직후 `sheet_logger.log_trade(action="SELL", ...)` 호출
+    - 체결 차수, 매도가, 수량, 수수료(USDT), 실현 손익(`pnl`), 수익률(`pnl_pct`), 매도 사유(조정률 포함) 전송
+  - **매수 체결 로깅 추가**:
+    - `매수체크()` 내 분할 매수 주문 성공 및 텔레그램 메시지 발송 직후 `sheet_logger.log_trade(action="BUY", ...)` 호출
+    - 체결 차수, 매수가, 수량, 낙폭률 메모 전송
+- **검증 결과**:
+  - `python -m py_compile bitget_Ejftkdhvkf.py` 구문 검사 통과
+  - `sheets_logger` 모듈 임포트 및 인스턴스 생성 검증 완료
+  - EC2 실서버 파일 배포 및 원격 구문 검증 완료
+
+
 

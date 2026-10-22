@@ -67,6 +67,15 @@ from zoneinfo import ZoneInfo
 # --- 시간 기준: 한국시간(KST) 고정 (서버 타임존과 무관하게 통일) ---
 KST = ZoneInfo("Asia/Seoul")
 
+# [구글 시트 연동 로거 추가]
+from sheets_logger import SheetsLogger
+sheet_logger = SheetsLogger(
+    webhook_url="https://script.google.com/macros/s/AKfycbws77Zb7aGqs_L5K0yLDf5iDVBXHKO_abf5eL1vlvUTh4197W-dujvmxm-vEBj8Hjdq/exec",
+    auth_token="trading_secret_2026",
+    strategy_name="떨사오팔",
+    exchange="Bitget"
+)
+
 # --- 비트겟 API (본인 키로 교체) ---
 
 #   키는 서버의 /var/autobot/bitget_Ejftkdhvkf/bitget_keys.py 에서 읽는다.
@@ -1204,6 +1213,21 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         )
         telegram_alert.SendMessage(msg)
 
+        # [구글 시트 체결 기록 전송 추가]
+        real_pnl = (net_sell - buy_price_f) * quantity  # 실현 손익 (USDT)
+        fee_usdt = real_sell_price * quantity * 0.0006  # 매도 수수료 (USDT)
+        sheet_logger.log_trade(
+            action="SELL",
+            symbol=symbol,
+            level=f"{df.at[index, '차수']}차",
+            price=real_sell_price,
+            amount=quantity,
+            fee=fee_usdt,
+            pnl=real_pnl,
+            pnl_pct=profit_pct,
+            note=f"{sell_reason} (조정률 {adj_pct:+.2f}%)"
+        )
+
     if not sell_orders:
         remaining = 0 if stock_data.empty else len(stock_data[pd.isna(stock_data["매도가"])])
         now_utc = datetime.now(timezone.utc)
@@ -1399,6 +1423,17 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
             f"📊 고점 대비 낙폭률(LS): {drop_rate:.2f}%"
         )
         telegram_alert.SendMessage(msg)
+
+        # [구글 시트 체결 기록 전송 추가]
+        sheet_logger.log_trade(
+            action="BUY",
+            symbol=symbol,
+            level=f"{next_round}차",
+            price=real_buy_price,
+            amount=buy_amt,
+            note=f"떨사 분할 매수 실행 (낙폭률 {drop_rate:.2f}%)"
+        )
+
         return True
 
     else:
