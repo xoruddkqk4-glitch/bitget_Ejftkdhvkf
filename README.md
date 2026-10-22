@@ -155,5 +155,16 @@
   - `sheets_logger` 모듈 임포트 및 인스턴스 생성 검증 완료
   - EC2 실서버 파일 배포 및 원격 구문 검증 완료
 
+## [2026-10-22 23:44] 업데이트 이력 (Commit ID: TBD)
+- **요청 사항**:
+  - 구글 스프레드시트 체결 기록 전송 시 기록 시각(타임스탬프)을 한국 표준시(KST, UTC+9) 기준으로 정확하게 기록하도록 개선
+- **수정 내용**:
+  - **구글 스프레드시트 웹훅 로거 타임스탬프 KST 적용 (`sheets_logger.py`)**:
+    - `datetime`, `timezone`, `timedelta`를 활용하여 KST(UTC+9) 타임존 객체 정의 (`KST = timezone(timedelta(hours=9))`)
+    - `log_trade()` 메서드에서 외부 타임스탬프 미지정 시 기본 생성되는 `now_str`을 `datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")`로 수정하여 서버 환경(UTC 등)과 관계없이 한국 시간 기준으로 구글 시트에 일관되게 기록되도록 보장
+- **검증 결과**:
+  - `python -m py_compile sheets_logger.py` 및 `bitget_Ejftkdhvkf.py` 구문 검사 정상 통과
+  - EC2 실서버 파일 배포 및 원격 구문 검증 완료
+
 
 
