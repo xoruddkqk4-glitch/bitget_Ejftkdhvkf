@@ -186,6 +186,18 @@
   - `python -m py_compile manual_buy.py` 구문 검사 정상 통과
   - `python manual_buy.py --help` CLI 인자 파싱 및 모듈 로딩 정상 검증 완료
 
-
-
-
+## [2026-10-23 21:26] 업데이트 이력 (Commit ID: TBD)
+- **요청 사항**:
+  - 구글 시트 웹훅 전송 및 로깅 시 데이터 처리 속도 향상과 함께, 봇 내부 상태 동기화 및 원장 유지관리 기능 추가 요청
+- **수정 내용**:
+  - **HTTP 커넥션 풀링을 통한 데이터 처리 속도 대폭 향상 (`sheets_logger.py`)**:
+    - `requests.Session()` 인스턴스를 초기화하여 매 요청마다 발생하던 TCP 3-way handshake 및 SSL/TLS 재협상 오버헤드를 제거
+    - `log_trade()` 및 `log_snapshot()`에서 세션 커넥션을 재사용(`http_client = self._session or requests`)하여 데이터 전송 응답 속도 및 네트워크 효율 극대화
+  - **봇 내부 상태 및 원장 관리 원격 제어 메서드 확장 (`sheets_logger.py`)**:
+    - `log_bot_state()`: 쿨링다운, 공백 예약, 잔고부족 차수 등 봇의 실시간 내부 상태를 대시보드 및 구글 시트로 비동기 전송 (타임아웃 2초 및 예외 격리로 메인 매매 루프 완벽 보장)
+    - `trigger_monthly_archive()`: 원장 데이터 누적으로 인한 시트 속도 저하를 방지하기 위해 월별 탭 자동 아카이브를 원격 트리거하는 기능 추가
+    - `trigger_yearly_sharding()`: 연간 원장 파일을 별도 분리(샤딩)하여 원장 성능을 최적화하는 원격 실행 기능 추가
+    - `diagnose_capacity()`: 원장 용량 및 건강도 진단 원격 조회 기능 구현
+- **검증 결과**:
+  - `python -m py_compile sheets_logger.py` 구문 검사 정상 통과
+  - EC2 실서버 파일 배포 및 원격 구문 검증 완료
