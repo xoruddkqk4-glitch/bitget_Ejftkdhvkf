@@ -201,3 +201,22 @@
 - **검증 결과**:
   - `python -m py_compile sheets_logger.py` 구문 검사 정상 통과
   - EC2 실서버 파일 배포 및 원격 구문 검증 완료
+
+## [2026-10-24 11:05] 업데이트 이력 (Commit ID: TBD)
+- **요청 사항**:
+  - 구글 스프레드시트 연동 보안 강화 및 소스 코드 내 웹훅 URL과 인증 토큰 하드코딩 제거 요청
+  - 서버 공통 환경설정 파일(`/var/autobot/gsheet.env`) 기반 자동 설정 주입 지원 요청
+- **수정 내용**:
+  - **구글 시트 로거 보안 강화 및 환경설정 파일 자동 로드 (`sheets_logger.py`)**:
+    - `DEFAULT_ENV_FILE = "/var/autobot/gsheet.env"` (또는 환경변수 `GSHEET_ENV_FILE`)에서 `GSHEET_*` 설정을 안전하게 파싱하여 `os.environ`에 주입하는 `_load_env_file()` 구현
+    - 기본 인증 토큰 하드코딩(`trading_secret_2026`)을 완전히 제거하고 `GSHEET_AUTH_TOKEN` 환경변수로만 주입받도록 보안 강화
+    - 배포 ID만 환경변수에 입력된 경우에도 표준 웹앱 URL(`https://script.google.com/macros/s/{id}/exec`)로 자동 정규화하는 보정 로직 추가
+    - 토큰 누락 시 명확한 경고 출력 및 예외 격리 유지
+  - **떨사오팔 메인 봇 하드코딩 제거 (`bitget_Ejftkdhvkf.py`)**:
+    - `SheetsLogger` 인스턴스 생성 시 소스에 하드코딩되어 있던 `webhook_url` 및 `auth_token` 매개변수 제거
+    - 환경변수 및 공통 설정 파일(`gsheet.env`)을 통해 자동으로 자격증명을 주입받도록 설정 일원화
+- **검증 결과**:
+  - `python -m py_compile bitget_Ejftkdhvkf.py sheets_logger.py` 로컬 구문 컴파일 통과
+  - EC2 실서버 파일 전송 (`scp`) 및 원격 구문 검증 완료
+  - EC2 상에서 `sheets_logger`의 `gsheet.env` 자동 로드 및 Webhook 엔드포인트 연동 테스트 정상 완료
+
