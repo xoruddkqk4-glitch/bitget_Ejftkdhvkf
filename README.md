@@ -220,3 +220,25 @@
   - EC2 실서버 파일 전송 (`scp`) 및 원격 구문 검증 완료
   - EC2 상에서 `sheets_logger`의 `gsheet.env` 자동 로드 및 Webhook 엔드포인트 연동 테스트 정상 완료
 
+## [2026-10-24 13:38] 업데이트 이력 (Commit ID: TBD)
+- **수정 내용**:
+  - **`sheets_logger.py` 백그라운드 스레드 큐 및 로컬 Outbox 장애 복구 아키텍처 구축 ([`sheets_logger.py`](file:///c:/Users/user/Desktop/trading_buddy/06비트겟자동매매-4기/week_02-bitget_Ejftkdhvkf/떨사오팔봇/sheets_logger.py))**:
+    - **1) 논블로킹 백그라운드 스레드 큐 (`queue.Queue`, `threading.Thread`) 도입**:
+      - `async_mode=True` 기본 활성화: `log_trade`, `log_trades_batch`, `log_snapshot`, `log_bot_state` 호출 시 큐에 즉시 삽입하고 반환하여 매매 루프의 지연시간을 0ms 수준으로 최소화
+      - 첫 전송 요청 시 백그라운드 워커 스레드 자동 가동 (Lazy Start)
+    - **2) 로컬 Outbox 장애 복구 시스템 (`sheets_outbox_*.jsonl`) 구현**:
+      - Google 서버 지연, 네트워크 단절 등으로 전송 실패 시 체결 데이터를 전략별 로컬 Outbox 파일에 안전하게 보관
+      - 백그라운드 워커에서 60초 주기 재전송 시도 및 네트워크 다운 시 자동 백오프(`NETWORK_DOWN_BACKOFF_SEC=30`) 적용
+      - 중복 전송 방지: 서버 측 `trade_id` 기반 중복 검증 연동 (서버의 `duplicate` 응답 수신 시에도 성공 처리)
+      - 최대 재시도 초과 시 `.dead.jsonl` 격리 보관
+    - **3) 봇 상태 최신 1건 압축(Coalescing) 전송**:
+      - `log_bot_state`는 최신 상태 1건만 유지하도록 전송 버퍼 압축 처리
+    - **4) 프로세스 정상 종료 시 안전 플러시 (`atexit`)**:
+      - SIGTERM 등 종료 시 대기 중인 큐의 체결 데이터를 최대 5초간 안전하게 전송
+    - **5) Webhook URL 포맷 자동 보정 및 KST 타임존 정합성 유지**:
+      - Apps Script 배포 ID만 기재된 경우 정규 URL 자동 보정 및 스냅샷 일자 생성 시 KST 타임존 적용 유지
+- **검증 결과**:
+  - `python -m py_compile sheets_logger.py bitget_Ejftkdhvkf.py manual_buy.py` 정적 구문 컴파일 검증 완료 (오류 0건 통과)
+  - EC2 실서버(`ec2:/var/autobot/bitget_Ejftkdhvkf/`) 파일 배포 및 원격 구문 검증 완료
+
+
