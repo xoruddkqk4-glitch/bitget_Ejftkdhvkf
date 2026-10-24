@@ -220,7 +220,7 @@
   - EC2 실서버 파일 전송 (`scp`) 및 원격 구문 검증 완료
   - EC2 상에서 `sheets_logger`의 `gsheet.env` 자동 로드 및 Webhook 엔드포인트 연동 테스트 정상 완료
 
-## [2026-10-24 13:38] 업데이트 이력 (Commit ID: TBD)
+## [2026-10-24 13:38] 업데이트 이력 (Commit ID: bede1a8)
 - **수정 내용**:
   - **`sheets_logger.py` 백그라운드 스레드 큐 및 로컬 Outbox 장애 복구 아키텍처 구축 ([`sheets_logger.py`](file:///c:/Users/user/Desktop/trading_buddy/06비트겟자동매매-4기/week_02-bitget_Ejftkdhvkf/떨사오팔봇/sheets_logger.py))**:
     - **1) 논블로킹 백그라운드 스레드 큐 (`queue.Queue`, `threading.Thread`) 도입**:
