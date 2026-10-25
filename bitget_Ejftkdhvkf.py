@@ -1231,6 +1231,37 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         remaining = 0 if stock_data.empty else len(stock_data[pd.isna(stock_data["매도가"])])
         now_utc = datetime.now(timezone.utc)
 
+        # 미매도 보유 차수별 매도 기준가 목록 구성
+        rounds_detail_lines = []
+        if not stock_data.empty:
+            uncompleted_df = stock_data[pd.isna(stock_data["매도가"])].copy()
+            if not uncompleted_df.empty:
+                try:
+                    uncompleted_df["_sort_round"] = pd.to_numeric(uncompleted_df["차수"], errors="coerce")
+                    uncompleted_df = uncompleted_df.sort_values(by="_sort_round")
+                except Exception:
+                    pass
+
+                for _, r_row in uncompleted_df.iterrows():
+                    try:
+                        r_num = int(r_row["차수"])
+                    except Exception:
+                        r_num = r_row["차수"]
+
+                    try:
+                        b_price = float(r_row["매수가"])
+                    except Exception:
+                        b_price = 0.0
+
+                    t_price = b_price * (1.0 + SELL_PROFIT_PCT)
+                    r_key = str(r_num)
+                    r_stage = rounds_dict.get(r_key, {}).get("stage", 1)
+                    stage_str = ", 2단계" if r_stage == 2 else ""
+
+                    rounds_detail_lines.append(f"  • {r_num}차: {t_price:.2f} (매수가 {b_price:.2f}{stage_str})")
+
+        rounds_detail_str = ("\n🎯 차수별 매도 기준가:\n" + "\n".join(rounds_detail_lines)) if rounds_detail_lines else ""
+
         # 1) 매일 1회 일일 매수 점검 턴 (평일 19:51 UTC 또는 force_buy):
         #    사용자 요청에 따라 매도 점검 결과(매도 없음)와 매수 결과를 순차적으로 항상 전송
         if is_daily_buy_turn:
@@ -1248,6 +1279,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                 f"🔹 이유: 목표가 미도달 & 보유기간 미경과\n"
                 f"📈 현재가(LS): {disp_price:.2f}\n"
                 f"🧾 미매도 보유 차수: {remaining}개"
+                f"{rounds_detail_str}"
             )
             telegram_alert.SendMessage(msg)
             print(f"[매도 점검] {stock_code} 매도 없음 알림 발송 (일일 매수 점검 턴 / 잔여 {remaining}개)")
@@ -1263,6 +1295,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     f"🔹 상태: 목표가 미도달 & 2단계 추세 유지 중\n"
                     f"📈 현재가(LS): {current_price:.2f}\n"
                     f"🧾 미매도 보유 차수: {remaining}개 (2단계 추세추종: {stage2_cnt}개)"
+                    f"{rounds_detail_str}"
                 )
                 telegram_alert.SendMessage(msg)
             else:
@@ -1436,12 +1469,20 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
         return True
 
     else:
+        target_buy_price = open_price * (1.0 - BUY_DROP_PCT)
+        price_items = [
+            ("📈 시가(LS)", open_price),
+            ("💲 현재가(LS)", current_price),
+            ("🎯 기준가", target_buy_price)
+        ]
+        # 가격 높은 순(내림차순) 정렬
+        price_items.sort(key=lambda x: x[1], reverse=True)
+        price_lines = "\n".join([f"{label}: {val:.2f}" for label, val in price_items])
+
         msg = (
             f"⏸️ {stock_code} 매수 보류\n"
             f"🔹 조건: 현재가 ≤ 시가×{(1.0-BUY_DROP_PCT):.3f}\n"
-            f"📈 시가(LS): {open_price:.2f}\n"
-            f"💲 현재가(LS): {current_price:.2f}\n"
-            f"🎯 기준가: {(open_price*(1.0-BUY_DROP_PCT)):.2f}\n"
+            f"{price_lines}\n"
             f"메모: 떨사오팔 일반 전략 조건 미충족으로 매수하지 않습니다."
         )
         telegram_alert.SendMessage(msg)
