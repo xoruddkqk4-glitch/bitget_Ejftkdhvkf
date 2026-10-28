@@ -46,7 +46,7 @@
 #   반드시 소액으로 충분히 검증한 뒤 사용하세요.
 # =========================================================
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import pprint
 import os
@@ -452,7 +452,7 @@ IGNORE_MARKET_OPEN = True
 BUY_DROP_PCT = 0.015
 SELL_PROFIT_PCT = 0.025
 
-MAX_HOLD_DAYS_NORMAL = 20
+MAX_HOLD_DAYS_NORMAL = 40
 MAX_HOLD_DAYS_HIGH_DROP = 50
 
 # 고점 계산 기간 (2026-08-06: LS떨사오팔봇과 통일, 백테스팅 최적값)
@@ -1258,7 +1258,19 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     r_stage = rounds_dict.get(r_key, {}).get("stage", 1)
                     stage_str = ", 2단계" if r_stage == 2 else ""
 
-                    rounds_detail_lines.append(f"  • {r_num}차: {t_price:.2f} (매수가 {b_price:.2f}{stage_str})")
+                    r_max_hold_days = MAX_HOLD_DAYS_HIGH_DROP if bool(r_row.get("고점대비하락조건", False)) else MAX_HOLD_DAYS_NORMAL
+                    force_sell_str = ""
+                    try:
+                        if isinstance(r_row["날짜"], pd.Timestamp):
+                            r_buy_date = r_row["날짜"].date()
+                        else:
+                            r_buy_date = datetime.strptime(str(r_row["날짜"])[:10], "%Y-%m-%d").date()
+                        force_sell_date = r_buy_date + timedelta(days=r_max_hold_days)
+                        force_sell_str = f", 강제매도일 {force_sell_date.strftime('%Y-%m-%d')}"
+                    except Exception:
+                        pass
+
+                    rounds_detail_lines.append(f"  • {r_num}차: {t_price:.2f} (매수가 {b_price:.2f}{force_sell_str}{stage_str})")
 
         rounds_detail_str = ("\n🎯 차수별 매도 기준가:\n" + "\n".join(rounds_detail_lines)) if rounds_detail_lines else ""
 
