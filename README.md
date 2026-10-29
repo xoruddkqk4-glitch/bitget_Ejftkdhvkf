@@ -268,5 +268,18 @@
 - **검증 결과**:
   - `python -m py_compile bitget_Ejftkdhvkf.py` 구문 검사 정상 통과
 
+## [2026-10-29 23:06] 업데이트 이력 (Commit ID: TBD)
+- **요청 사항**:
+  - 대시보드 및 구글 시트와 떨사오팔 봇의 실시간 상태(2단계 추세추종 지표 및 보유 차수 상태)를 동기화하도록 `STATE_SYNC` 연동 추가
+- **수정 내용**:
+  - **4시간봉 5MA 추세 지표 상시 조회 (`bitget_Ejftkdhvkf.py`)**:
+    - `매도체크()`에서 2단계 진입 차수 보유 여부(`has_stage2`)와 무관하게 `get_trend_ma_status(exchange, symbol)`를 매 주기 조회하여 대시보드에 실시간 추세 데이터 제공
+  - **구글 시트 봇 상태 동기화 연동 (`bitget_Ejftkdhvkf.py`)**:
+    - `매도체크()` 종료 시점에 `sheet_logger.log_bot_state()`를 호출하여 심볼, 종목코드, `trend_riding` 상태(`active`, `stage2_active`, `prev_close_4h`, `ma5_4h`, `timeframe`, `ma_period`) 및 최신 보유 차수(`rounds`) 정보를 비동기 전송
+    - 예외 격리(`try-except`)를 적용하여 상태 동기화 오류가 매매 루프에 영향을 주지 않도록 방어
+- **검증 결과**:
+  - `python -m py_compile bitget_Ejftkdhvkf.py` 정적 구문 검사 통과
+
+
 
 

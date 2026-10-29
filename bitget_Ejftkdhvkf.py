@@ -1062,14 +1062,10 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
     current_invest_money = 투자금시트_초기화_및_불러오기(stock_code, default_invest_money)
     highest_price_30d = 과거_고점찾기(stock_code, ohlcv)
 
-    # 미매도 차수 중 2단계(추세추종) 진입 차수가 있으면 4시간봉 5MA 지표 사전 조회
+    # 대시보드 STATE_SYNC 및 2단계(추세추종) 판정을 위해 4시간봉 5MA 지표 조회 (보유 0개여도 조회)
     rounds_dict = state.get(stock_code, {}).get("rounds", {})
     has_stage2 = any(r.get("stage") == 2 for r in rounds_dict.values())
-    is_ma5_broken = False
-    prev_close_4h = 0.0
-    ma5_4h = 0.0
-    if has_stage2:
-        is_ma5_broken, prev_close_4h, ma5_4h = get_trend_ma_status(exchange, symbol)
+    is_ma5_broken, prev_close_4h, ma5_4h = get_trend_ma_status(exchange, symbol)
 
     for index, row in stock_data.iterrows():
         if pd.notna(row.get("매도가", None)):
@@ -1316,6 +1312,25 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
             print(f"[매도 없음] {stock_code} (목표가 미도달 or 2단계 홀딩 중 / 잔여 {remaining}개)")
 
     매매기록저장(df)
+    try:
+        latest_state = load_round_state()
+        latest_rounds = latest_state.get(stock_code, {}).get("rounds", {})
+        has_stage2_now = any(r.get("stage") == 2 for r in latest_rounds.values())
+        sheet_logger.log_bot_state({
+            "symbol": symbol,
+            "stock_code": stock_code,
+            "trend_riding": {
+                "active": bool(prev_close_4h > 0 and not is_ma5_broken),
+                "stage2_active": bool(has_stage2_now),
+                "prev_close_4h": round(float(prev_close_4h), 4),
+                "ma5_4h": round(float(ma5_4h), 4),
+                "timeframe": TREND_TIMEFRAME,
+                "ma_period": TREND_MA_PERIOD,
+            },
+            "rounds": latest_rounds,
+        }, strategy_name="떨사오팔")
+    except Exception as e:
+        print(f"⚠️ [STATE_SYNC] 떨사오팔 상태 동기화 오류(무시): {e}")
     return sell_orders
 
 
