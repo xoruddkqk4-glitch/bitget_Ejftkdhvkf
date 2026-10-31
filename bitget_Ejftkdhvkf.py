@@ -364,61 +364,73 @@ def sync_round_state_from_excel(df, stock_code):
     if df is not None and not df.empty and "종목" in df.columns:
         stock_data = df[df["종목"] == stock_code]
 
-        # 1. 미매도 상태인 행(매도가가 없는 행)만 추출하여 활성 차수 집합 구성
-        active_rows = stock_data[stock_data["매도가"].isna()]
-        active_keys = set()
+        # 1. 미매도 상태인 행(매도가가 없는 행)만 추출하여 매수가 기준 내림차순 정렬 및 1~N차 빈칸 없이 앞당김 정렬
+        active_rows = stock_data[stock_data["매도가"].isna()].copy()
         excel_updated = False
-        max_seen_active = 0
+        prev_rounds = dict(rounds)
+        new_rounds = {}
+        used_prev_keys = set()
 
-        for idx, row in active_rows.iterrows():
-            r_num = int(row["차수"])
-            # 뒤 번호 이어쓰기 보정: 선행 미매도 차수보다 낮은 번호로 매수된 후행 미매도 건이 있으면 max_seen_active + 1 로 자동 보정
-            if max_seen_active > 0 and r_num <= max_seen_active and max_seen_active < 39:
-                old_key = str(r_num)
-                r_num = max_seen_active + 1
-                df.loc[idx, "차수"] = r_num
-                excel_updated = True
-                if old_key in rounds and str(r_num) not in rounds:
-                    rounds[str(r_num)] = rounds.pop(old_key)
-            if r_num > max_seen_active:
-                max_seen_active = r_num
+        if not active_rows.empty:
+            active_rows["_buy_price_num"] = pd.to_numeric(active_rows["매수가"], errors="coerce").fillna(0.0)
+            active_rows["_orig_idx"] = active_rows.index
+            active_rows = active_rows.sort_values(by=["_buy_price_num", "_orig_idx"], ascending=[False, True])
 
-            r_key = str(r_num)
-            active_keys.add(r_key)
-            buy_price = float(row["매수가"])
-            qty = float(row["수량"])
-            target_price = buy_price * (1.0 + SELL_PROFIT_PCT)
+            for seq_idx, (idx, row) in enumerate(active_rows.iterrows(), start=1):
+                old_r_num = int(row["차수"]) if pd.notna(row["차수"]) else seq_idx
+                new_r_num = seq_idx
+                if old_r_num != new_r_num:
+                    df.loc[idx, "차수"] = new_r_num
+                    excel_updated = True
 
-            if r_key not in rounds:
-                rounds[r_key] = {
-                    "stage": 1,
-                    "buy_price": buy_price,
-                    "quantity": qty,
-                    "target_price": target_price,
-                    "preservation_line": target_price,
-                    "stage2_entered_at": None,
-                }
-            else:
-                # 기존 차수의 stage, preservation_line, stage2_entered_at 등은 보존하고,
-                # 최신 매수가, 수량, 목표가 메타정보만 업데이트
-                rounds[r_key]["buy_price"] = buy_price
-                rounds[r_key]["quantity"] = qty
-                rounds[r_key]["target_price"] = target_price
-                if "stage" not in rounds[r_key]:
-                    rounds[r_key]["stage"] = 1
-                if "preservation_line" not in rounds[r_key]:
-                    rounds[r_key]["preservation_line"] = target_price
+                r_key = str(new_r_num)
+                buy_price = float(row["매수가"])
+                qty = float(row["수량"])
+                target_price = buy_price * (1.0 + SELL_PROFIT_PCT)
 
-        # 2. 현재 미매도 목록에 없는(이미 전량 매도 완료된) 과거 차수는 rounds에서 안전하게 정리
-        for r_key in list(rounds.keys()):
-            if r_key not in active_keys:
-                rounds.pop(r_key, None)
+                # 기존 차수 상태(stage, preservation_line, stage2_entered_at)를 (매수가, 수량) 기준으로 매칭하여 보존
+                matched_prev = None
+                old_key = str(old_r_num)
+                if old_key in prev_rounds and old_key not in used_prev_keys:
+                    p_info = prev_rounds[old_key]
+                    if abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and abs(float(p_info.get("quantity", 0.0)) - qty) < 0.02:
+                        matched_prev = p_info
+                        used_prev_keys.add(old_key)
+                if matched_prev is None:
+                    for pk, p_info in prev_rounds.items():
+                        if pk in used_prev_keys:
+                            continue
+                        if abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and abs(float(p_info.get("quantity", 0.0)) - qty) < 0.02:
+                            matched_prev = p_info
+                            used_prev_keys.add(pk)
+                            break
+
+                if matched_prev is not None:
+                    new_rounds[r_key] = {
+                        "stage": int(matched_prev.get("stage", 1)),
+                        "buy_price": buy_price,
+                        "quantity": qty,
+                        "target_price": target_price,
+                        "preservation_line": float(matched_prev.get("preservation_line", target_price)),
+                        "stage2_entered_at": matched_prev.get("stage2_entered_at", None),
+                    }
+                else:
+                    new_rounds[r_key] = {
+                        "stage": 1,
+                        "buy_price": buy_price,
+                        "quantity": qty,
+                        "target_price": target_price,
+                        "preservation_line": target_price,
+                        "stage2_entered_at": None,
+                    }
+
+        stock_dict["rounds"] = new_rounds
 
         if excel_updated:
             try:
                 매매기록저장(df)
             except Exception as e:
-                print(f"[차수 이어쓰기 엑셀 자동 보정 저장 실패] {e}")
+                print(f"[차수 정렬 엑셀 자동 보정 저장 실패] {e}")
 
     save_round_state(state)
     return state
@@ -1049,25 +1061,16 @@ def 과거_고점찾기(stock_code, ohlcv=None):
 
 def 가능다음차수(stock_data):
     """
-    뒤 번호 이어쓰기 방식:
-    - 현재 미매도 보유 차수가 없으면 1차부터 시작
-    - 미매도 보유 차수가 있으면 현재 보유 중인 최대 차수 + 1 (예: 1차 손절 후 2, 3, 4차 보유 중이면 5차 반환)
-    - 최대 차수(39차) 도달 시에만 비어있는 하위 차수 탐색
+    빈 차수 없이 1~N차 앞당김 + 맨 뒤 차수 추가 방식:
+    - 기존 미매도 보유 차수들이 1~N차로 빈칸 없이 채워지므로,
+      신규 매수 차수는 항상 미매도 보유 개수 + 1 (보유 0개일 때 1차, 3개 보유 중일 때 4차)
     """
     if stock_data is None or stock_data.empty:
         return 1
     active_rows = stock_data[stock_data["매도가"].isna()]
-    if active_rows.empty:
-        return 1
-    active_nums = active_rows["차수"].dropna().astype(int)
-    if active_nums.empty:
-        return 1
-    max_active_round = int(active_nums.max())
-    if max_active_round < 39:
-        return max_active_round + 1
-    for round_num in range(1, 40):
-        if round_num not in active_nums.values:
-            return round_num
+    active_cnt = len(active_rows)
+    if active_cnt < 39:
+        return active_cnt + 1
     return None
 
 
@@ -1258,7 +1261,10 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
             note=f"{sell_reason} (조정률 {adj_pct:+.2f}%)"
         )
 
-    if not sell_orders:
+    if sell_orders:
+        # 매도(강제매도/익절) 발생으로 빈 차수가 생기면 남은 미매도 차수들을 매수가 내림차순으로 1차부터 순서대로 앞당김
+        state = sync_round_state_from_excel(df, stock_code)
+    else:
         remaining = 0 if stock_data.empty else len(stock_data[pd.isna(stock_data["매도가"])])
         now_utc = datetime.now(timezone.utc)
 
@@ -1392,7 +1398,7 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
     df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
     매매기록저장(df)
 
-    # 차수별 상태 파일 등록 (새로운 매수는 1단계로 진입)
+    # 차수별 상태 파일 등록 (새로운 매수는 1단계로 진입) 후 매수가 내림차순 1~N차 정렬 동기화
     target_price = float(buy_price) * (1.0 + SELL_PROFIT_PCT)
     update_round_stage(
         stock_code,
@@ -1403,6 +1409,7 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
         buy_price=float(buy_price),
         quantity=float(quantity)
     )
+    sync_round_state_from_excel(df, stock_code)
     print(f"{stock_code} {round_number}차 매수 기록 및 상태(1단계) 등록 완료 - 매수가: {buy_price}, 수량: {quantity}, 고점대비하락조건: {high_drop_condition}")
 
 
@@ -1412,6 +1419,7 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
 # =========================
 def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None):
     df = 매매기록불러오기()
+    sync_round_state_from_excel(df, stock_code)
     stock_data = df[df["종목"] == stock_code]
 
     # ✅ 당일(KST 기준) 이미 매수한 이력이 있는지 사전 점검 (5분 크론탭 급락 시 연속 매수 원천 차단)
