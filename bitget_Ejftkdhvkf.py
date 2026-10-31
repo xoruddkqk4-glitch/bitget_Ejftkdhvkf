@@ -367,9 +367,23 @@ def sync_round_state_from_excel(df, stock_code):
         # 1. 미매도 상태인 행(매도가가 없는 행)만 추출하여 활성 차수 집합 구성
         active_rows = stock_data[stock_data["매도가"].isna()]
         active_keys = set()
+        excel_updated = False
+        max_seen_active = 0
 
-        for _, row in active_rows.iterrows():
-            r_key = str(int(row["차수"]))
+        for idx, row in active_rows.iterrows():
+            r_num = int(row["차수"])
+            # 뒤 번호 이어쓰기 보정: 선행 미매도 차수보다 낮은 번호로 매수된 후행 미매도 건이 있으면 max_seen_active + 1 로 자동 보정
+            if max_seen_active > 0 and r_num <= max_seen_active and max_seen_active < 39:
+                old_key = str(r_num)
+                r_num = max_seen_active + 1
+                df.loc[idx, "차수"] = r_num
+                excel_updated = True
+                if old_key in rounds and str(r_num) not in rounds:
+                    rounds[str(r_num)] = rounds.pop(old_key)
+            if r_num > max_seen_active:
+                max_seen_active = r_num
+
+            r_key = str(r_num)
             active_keys.add(r_key)
             buy_price = float(row["매수가"])
             qty = float(row["수량"])
@@ -399,6 +413,12 @@ def sync_round_state_from_excel(df, stock_code):
         for r_key in list(rounds.keys()):
             if r_key not in active_keys:
                 rounds.pop(r_key, None)
+
+        if excel_updated:
+            try:
+                매매기록저장(df)
+            except Exception as e:
+                print(f"[차수 이어쓰기 엑셀 자동 보정 저장 실패] {e}")
 
     save_round_state(state)
     return state
@@ -1028,10 +1048,25 @@ def 과거_고점찾기(stock_code, ohlcv=None):
 
 
 def 가능다음차수(stock_data):
+    """
+    뒤 번호 이어쓰기 방식:
+    - 현재 미매도 보유 차수가 없으면 1차부터 시작
+    - 미매도 보유 차수가 있으면 현재 보유 중인 최대 차수 + 1 (예: 1차 손절 후 2, 3, 4차 보유 중이면 5차 반환)
+    - 최대 차수(39차) 도달 시에만 비어있는 하위 차수 탐색
+    """
+    if stock_data is None or stock_data.empty:
+        return 1
+    active_rows = stock_data[stock_data["매도가"].isna()]
+    if active_rows.empty:
+        return 1
+    active_nums = active_rows["차수"].dropna().astype(int)
+    if active_nums.empty:
+        return 1
+    max_active_round = int(active_nums.max())
+    if max_active_round < 39:
+        return max_active_round + 1
     for round_num in range(1, 40):
-        if round_num not in stock_data["차수"].values or (
-            round_num in stock_data["차수"].values and pd.notna(stock_data.loc[stock_data["차수"] == round_num, "매도가"]).all()
-        ):
+        if round_num not in active_nums.values:
             return round_num
     return None
 
@@ -1319,6 +1354,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         sheet_logger.log_bot_state({
             "symbol": symbol,
             "stock_code": stock_code,
+            "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             "trend_riding": {
                 "active": bool(prev_close_4h > 0 and not is_ma5_broken),
                 "stage2_active": bool(has_stage2_now),
@@ -1492,6 +1528,27 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
             amount=buy_amt,
             note=f"떨사 분할 매수 실행 (낙폭률 {drop_rate:.2f}%)"
         )
+        try:
+            latest_state = load_round_state()
+            latest_rounds = latest_state.get(stock_code, {}).get("rounds", {})
+            has_stage2_now = any(r.get("stage") == 2 for r in latest_rounds.values())
+            is_ma5_broken, prev_close_4h, ma5_4h = get_trend_ma_status(exchange, symbol)
+            sheet_logger.log_bot_state({
+                "symbol": symbol,
+                "stock_code": stock_code,
+                "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+                "trend_riding": {
+                    "active": bool(prev_close_4h > 0 and not is_ma5_broken),
+                    "stage2_active": bool(has_stage2_now),
+                    "prev_close_4h": round(float(prev_close_4h), 4),
+                    "ma5_4h": round(float(ma5_4h), 4),
+                    "timeframe": TREND_TIMEFRAME,
+                    "ma_period": TREND_MA_PERIOD,
+                },
+                "rounds": latest_rounds,
+            }, strategy_name="떨사오팔")
+        except Exception as e:
+            print(f"⚠️ [STATE_SYNC] 떨사오팔 매수 후 상태 동기화 오류(무시): {e}")
 
         return True
 
