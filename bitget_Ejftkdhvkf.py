@@ -1293,7 +1293,6 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     t_price = b_price * (1.0 + SELL_PROFIT_PCT)
                     r_key = str(r_num)
                     r_stage = rounds_dict.get(r_key, {}).get("stage", 1)
-                    stage_str = ", 2단계" if r_stage == 2 else ""
 
                     r_max_hold_days = MAX_HOLD_DAYS_HIGH_DROP if bool(r_row.get("고점대비하락조건", False)) else MAX_HOLD_DAYS_NORMAL
                     force_sell_str = ""
@@ -1307,7 +1306,15 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     except Exception:
                         pass
 
-                    rounds_detail_lines.append(f"  • {r_num}차: {t_price:.2f} (매수가 {b_price:.2f}{force_sell_str}{stage_str})")
+                    if r_stage == 2:
+                        ma_str = f"{ma5_4h:.2f}(2단계 진입)" if ma5_4h > 0 else f"{t_price:.2f}(2단계 진입)"
+                        rounds_detail_lines.append(
+                            f"  • {r_num}차: {ma_str} (매수가 {b_price:.2f}, 보존선 {t_price:.2f}{force_sell_str})"
+                        )
+                    else:
+                        rounds_detail_lines.append(
+                            f"  • {r_num}차: {t_price:.2f} (매수가 {b_price:.2f}{force_sell_str})"
+                        )
 
         rounds_detail_str = ("\n🎯 차수별 매도 기준가:\n" + "\n".join(rounds_detail_lines)) if rounds_detail_lines else ""
 
