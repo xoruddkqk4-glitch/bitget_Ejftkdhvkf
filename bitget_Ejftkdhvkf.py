@@ -504,6 +504,7 @@ TREND_TIMEFRAME = "4h"               # 추세 판정 캔들 시간프레임 (예
 TREND_MA_PERIOD = 5                  # 이동평균선 기간 (예: 5 → 5MA, 10 → 10MA)
 TREND_OHLCV_LIMIT = 10               # 추세 판정용 OHLCV 조회 캔들 수
 PRESERVATION_LINE_MULTIPLIER = 0.998  # 보존선 방어 매도 계수 (현재가 ≤ 보존선 × 이 값이면 매도)
+STAGE2_BRIEFING_INTERVAL_HOURS = 4   # 2단계 진입 차수 보유 시 정기 브리핑 발송 간격 (시간 단위)
 
 # =========================
 # ✅ 데이터 재시도 설정
@@ -1339,9 +1340,9 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
             )
             telegram_alert.SendMessage(msg)
             print(f"[매도 점검] {stock_code} 매도 없음 알림 발송 (일일 매수 점검 턴 / 잔여 {remaining}개)")
-        # 2) 그 외 일반 시간대의 매시 51분 (정기 브리핑):
+        # 2) 그 외 일반 시간대의 4시간 간격 51분 (정기 브리핑: KST 00:51, 04:51(주말), 08:51, 12:51, 16:51, 20:51):
         #    알림 피로도 최적화를 위해 2단계 추세추종 차수가 1개 이상 존재할 때만 발송
-        elif now_utc.minute == 51:
+        elif now_utc.minute == 51 and (now_utc.hour - 19) % STAGE2_BRIEFING_INTERVAL_HOURS == 0:
             latest_state = load_round_state()
             latest_rounds = latest_state.get(stock_code, {}).get("rounds", {})
             stage2_cnt = sum(1 for r in latest_rounds.values() if r.get("stage") == 2)
@@ -1355,7 +1356,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                 )
                 telegram_alert.SendMessage(msg)
             else:
-                print(f"[매도 없음] {stock_code} (2단계 추세추종 0개로 1시간 정기 브리핑 생략 / 잔여 {remaining}개)")
+                print(f"[매도 없음] {stock_code} (2단계 추세추종 0개로 {STAGE2_BRIEFING_INTERVAL_HOURS}시간 정기 브리핑 생략 / 잔여 {remaining}개)")
         else:
             print(f"[매도 없음] {stock_code} (목표가 미도달 or 2단계 홀딩 중 / 잔여 {remaining}개)")
 
