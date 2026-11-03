@@ -464,6 +464,13 @@ def remove_round_from_state(stock_code, round_number):
             del state[stock_code]["rounds"][r_key]
             save_round_state(state)
 
+def has_active_stage2_rounds(stock_code):
+    """엑셀 및 상태 파일을 동기화한 뒤, 현재 2단계(stage == 2)에 진입한 미매도 차수가 1개 이상 존재하는지 확인합니다."""
+    df = 매매기록불러오기()
+    state = sync_round_state_from_excel(df, stock_code)
+    rounds_dict = state.get(stock_code, {}).get("rounds", {})
+    return any(int(r.get("stage", 1)) == 2 for r in rounds_dict.values())
+
 
 # =========================
 # ✅ 최초 투자금 (USDT) — 종목별 첫 매수 기준금액. 여기서만 수정하세요.
@@ -1130,8 +1137,8 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         current_stage = r_info.get("stage", 1)
         preservation_line = float(r_info.get("preservation_line", target_price))
 
-        # 1) 타임컷 우선 체크
-        if (today - buy_date).days >= max_hold_days:
+        # 1) 타임컷 우선 체크 (일일 매수 점검 전 하루 1번 확인)
+        if is_daily_buy_turn and (today - buy_date).days >= max_hold_days:
             print(f"{stock_code} {round_number}차 떨사오팔 강제 매도 - {max_hold_days}일 경과")
             sell_orders.append((index, quantity, current_price * 0.98, f"보유기간 경과({max_hold_days}일)", buy_price, buy_date, round_number))
 
@@ -1144,23 +1151,26 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
             telegram_alert.SendMessage(msg)
             continue
 
-        # 2) 1단계: 1차 목표가 감시
+        # 2) 1단계: 1차 목표가 감시 (일일 매수 점검 전 하루 1번만 2단계 진입 여부 확인)
         if current_stage == 1:
-            if current_price >= target_price:
-                updated_info = update_round_stage(stock_code, round_number, stage=2, preservation_line=target_price, target_price=target_price, buy_price=buy_price, quantity=quantity)
-                rounds_dict[r_key] = updated_info
-                print(f"{stock_code} {round_number}차 1차 목표가 돌파 -> 2단계(추세추종) 승격!")
-                msg = (
-                    f"🎯 [1차 목표가 돌파] {stock_code} {round_number}차 2단계 승격\n"
-                    f"🔹 진입 단계: [2단계 추세 추종 모드]\n"
-                    f"📈 1차 목표가: {target_price:.2f} (수익률 +{SELL_PROFIT_PCT*100:.1f}%)\n"
-                    f"💲 현재가: {current_price:.2f}\n"
-                    f"🛡️ 최소 이익 보존선: {target_price:.2f}\n"
-                    f"💡 {TREND_TIMEFRAME}봉 {TREND_MA_PERIOD}MA 꺾임 시 초과 익절 또는 보존선 하향 터치({PRESERVATION_LINE_MULTIPLIER}) 시 즉시 방어 매도합니다."
-                )
-                telegram_alert.SendMessage(msg)
+            if is_daily_buy_turn:
+                if current_price >= target_price:
+                    updated_info = update_round_stage(stock_code, round_number, stage=2, preservation_line=target_price, target_price=target_price, buy_price=buy_price, quantity=quantity)
+                    rounds_dict[r_key] = updated_info
+                    print(f"{stock_code} {round_number}차 1차 목표가 돌파 -> 2단계(추세추종) 승격!")
+                    msg = (
+                        f"🎯 [1차 목표가 돌파] {stock_code} {round_number}차 2단계 승격\n"
+                        f"🔹 진입 단계: [2단계 추세 추종 모드]\n"
+                        f"📈 1차 목표가: {target_price:.2f} (수익률 +{SELL_PROFIT_PCT*100:.1f}%)\n"
+                        f"💲 현재가: {current_price:.2f}\n"
+                        f"🛡️ 최소 이익 보존선: {target_price:.2f}\n"
+                        f"💡 {TREND_TIMEFRAME}봉 {TREND_MA_PERIOD}MA 꺾임 시 초과 익절 또는 보존선 하향 터치({PRESERVATION_LINE_MULTIPLIER}) 시 즉시 방어 매도합니다."
+                    )
+                    telegram_alert.SendMessage(msg)
+                else:
+                    print(f"{stock_code} {round_number}차 1단계 일일 점검: 현재가 {current_price:.2f} < 목표가 {target_price:.2f} (2단계 미진입)")
             else:
-                print(f"{stock_code} {round_number}차 1단계 감시 중: 현재가 {current_price:.2f} < 목표가 {target_price:.2f}")
+                print(f"{stock_code} {round_number}차 1단계 대기 중 (일일 점검 시점에만 2단계 진입 확인)")
 
         # 3) 2단계: 추세추종 (시나리오 ② 보존선 방어 or 시나리오 ① 4h 5MA 이탈)
         elif current_stage == 2:
@@ -1593,18 +1603,27 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
 # ✅ 매수/매도 프로세스
 # =========================
 def 매수매도프로세스(exchange, symbol, stock_code, default_invest_money):
-    # ✅ OHLCV 데이터는 LS
-    ohlcv = LsCommon.GetOhlcv("US", stock_code)
-
-    # 1. 일일 매수 체크 시점 판별 : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴
+    # 1. 일일 매수/매도2단계 진입 체크 시점 판별 : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴
     now_utc = datetime.now(timezone.utc)
     is_weekday = now_utc.weekday() < 5                 # 월~금 (0~4)
     is_buy_minute = (now_utc.hour == 19 and now_utc.minute == 51)  # 19시 51분
     force_buy = os.environ.get("FORCE_BUY_CHECK", "0") == "1"
     is_daily_buy_turn = (is_weekday and is_buy_minute) or force_buy
 
-    # 2. [상시 매도 감시] : 5분마다 24시간 항상 실행
-    #    일일 매수 턴인 경우, 매도가 없어도 "매도 없음" 메시지를 발송하도록 플래그 전달
+    # 2. 일일 점검 턴이 아닌 일반 5분 크론탭 턴에서는 2단계(stage == 2) 진입 차수가 있을 때만 매도 감시 수행
+    if not is_daily_buy_turn:
+        if not has_active_stage2_rounds(stock_code):
+            print(
+                f"[매도/매수 스킵] 현재 2단계 진입 차수가 없으며 일일 점검 시간(평일 19:51 UTC, 현재 {now_utc.strftime('%H:%M')} UTC)이 아니므로 다음 날 점검 시점까지 대기합니다."
+            )
+            return
+
+    # ✅ OHLCV 데이터는 LS
+    ohlcv = LsCommon.GetOhlcv("US", stock_code)
+
+    # 3. [매도 감시] :
+    #    - 일일 매수 점검 턴(하루 1번): 매수 확인 전 1단계 -> 2단계 진입(승격) 여부 및 타임컷/2단계 매도 조건 확인
+    #    - 일반 5분 턴(2단계 진입 차수 보유 시): 2단계 차수의 매도 조건(추세 꺾임 / 보존선 방어)만 5분 간격 상시 감시
     매도_발생 = 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv, is_daily_buy_turn=is_daily_buy_turn)
     if 매도_발생:
         print("매도 완료. 계좌 정리 대기를 위해 10초 대기 중...")
@@ -1613,7 +1632,7 @@ def 매수매도프로세스(exchange, symbol, stock_code, default_invest_money)
         # 매도 메시지와 매수 메시지 순차 전송 시 텔레그램 수신 순서 보장을 위해 2초 대기
         time.sleep(2)
 
-    # 3. [일일 매수 체크] : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴에만 실행!
+    # 4. [일일 매수 체크] : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴에만 실행!
     if is_daily_buy_turn:
         print(f"[일일 매수 실행] 평일 19:51 UTC (현재: {now_utc.strftime('%H:%M:%S')} UTC) 매수 조건을 점검합니다.")
         매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv)
