@@ -348,6 +348,14 @@
 - **검증 결과**:
   - `python -m py_compile bitget_Ejftkdhvkf.py` 정적 구문 검사 통과
 
-
-
+## [2026-11-06 10:52] 업데이트 이력 (Commit ID: beab718)
+- **수정 내용**:
+  - **구글 시트 웹훅 전송 타임아웃 확장 및 락/일시 오류 재시도 처리 강화 (`sheets_logger.py`)**:
+    - 비동기 백그라운드 모드(`async_mode=True`) 전송 시 HTTP 타임아웃을 최소 `30초`로 확장(`timeout=max(self.timeout, 30 if self.async_mode else 10)`)하여 GAS 실행 지연 시 조기 타임아웃 방지
+    - GAS 응답에서 `retryable=True`, `code in ("LOCK_TIMEOUT", "INTERNAL_ERROR")` 또는 락/잠금/서버 처리 오류 메시지 수신 시 즉시 폐기(`reject`)하지 않고 `"retry"`를 반환하여 로컬 Outbox 재전송 큐에 안전하게 보관되도록 개선
+    - 웹훅 URL 프로토콜 검사 대소문자 무시(`raw_url.lower().startswith("http")`) 및 인증 토큰 원본 보존
+  - **원격 관리용 웹훅 트리거 보안 정책 반영 (`sheets_logger.py`)**:
+    - 보안 강화를 위해 외부 웹훅을 통한 원장 관리 호출(`ARCHIVE_MONTHLY`, `SHARD_YEARLY`, `DIAGNOSE`)을 비활성화(Deprecated)하고 Apps Script 편집기 내 직접 실행(`archiveMonthlyTrades`, `shardYearlyArchiveSpreadsheet`, `runFullDiagnostic`) 안내로 전환
+- **검증 결과**:
+  - `python -m py_compile sheets_logger.py bitget_Ejftkdhvkf.py manual_buy.py` 정적 구문 검사 통과
 
