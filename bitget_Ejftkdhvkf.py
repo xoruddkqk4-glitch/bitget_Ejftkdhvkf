@@ -64,8 +64,11 @@ import LS_API_Helper_US_new as LsiUS
 import ccxt
 from zoneinfo import ZoneInfo
 
-# --- 시간 기준: 한국시간(KST) 고정 (서버 타임존과 무관하게 통일) ---
+# --- 시간 기준: 한국시간(KST) 및 미국동부시간(US_EASTERN, 썸머타임 자동 반영) ---
 KST = ZoneInfo("Asia/Seoul")
+US_EASTERN = ZoneInfo("America/New_York")
+DAILY_CHECK_ET_HOUR = 15    # 미국 정규장 마감(16:00 ET) 10분 전 시각(시)
+DAILY_CHECK_ET_MINUTE = 51  # 미국 정규장 마감(16:00 ET) 10분 전 시각(분)
 
 # [구글 시트 연동 로거 추가]
 from sheets_logger import SheetsLogger
@@ -1277,7 +1280,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         state = sync_round_state_from_excel(df, stock_code)
     else:
         remaining = 0 if stock_data.empty else len(stock_data[pd.isna(stock_data["매도가"])])
-        now_utc = datetime.now(timezone.utc)
+        now_et = datetime.now(US_EASTERN)
 
         # 미매도 보유 차수별 매도 기준가 목록 구성
         rounds_detail_lines = []
@@ -1329,7 +1332,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
         rounds_detail_str = ("\n🎯 차수별 매도 기준가:\n" + "\n".join(rounds_detail_lines)) if rounds_detail_lines else ""
 
-        # 1) 매일 1회 일일 매수 점검 턴 (평일 19:51 UTC 또는 force_buy):
+        # 1) 매일 1회 일일 매수 점검 턴 (평일 15:51 ET [썸머타임 자동 반영] 또는 force_buy):
         #    사용자 요청에 따라 매도 점검 결과(매도 없음)와 매수 결과를 순차적으로 항상 전송
         if is_daily_buy_turn:
             # 매수 메시지와 일관성을 위해 가능하면 LS 현재가 조회 시도, 실패 시 선물 현재가 사용
@@ -1350,9 +1353,9 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
             )
             telegram_alert.SendMessage(msg)
             print(f"[매도 점검] {stock_code} 매도 없음 알림 발송 (일일 매수 점검 턴 / 잔여 {remaining}개)")
-        # 2) 그 외 일반 시간대의 4시간 간격 51분 (정기 브리핑: KST 00:51, 04:51(주말), 08:51, 12:51, 16:51, 20:51):
+        # 2) 그 외 일반 시간대의 4시간 간격 51분 (정기 브리핑: 미국 장 마감 10분 전 기준 4시간 간격, 썸머타임 자동 반영):
         #    알림 피로도 최적화를 위해 2단계 추세추종 차수가 1개 이상 존재할 때만 발송
-        elif now_utc.minute == 51 and (now_utc.hour - 19) % STAGE2_BRIEFING_INTERVAL_HOURS == 0:
+        elif now_et.minute == DAILY_CHECK_ET_MINUTE and (now_et.hour - DAILY_CHECK_ET_HOUR) % STAGE2_BRIEFING_INTERVAL_HOURS == 0:
             latest_state = load_round_state()
             latest_rounds = latest_state.get(stock_code, {}).get("rounds", {})
             stage2_cnt = sum(1 for r in latest_rounds.values() if r.get("stage") == 2)
@@ -1603,10 +1606,21 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
 # ✅ 매수/매도 프로세스
 # =========================
 def 매수매도프로세스(exchange, symbol, stock_code, default_invest_money):
-    # 1. 일일 매수/매도2단계 진입 체크 시점 판별 : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴
+    # 1. 일일 매수/매도2단계 진입 체크 시점 판별 : 미국 동부시간(ET) 평일 15:51 (미국 장 마감 10분 전, 썸머타임 자동 반영)
+    #    - 썸머타임 적용(EDT, UTC-4): 15:51 EDT = 19:51 UTC = 04:51 KST
+    #    - 썸머타임 해제(EST, UTC-5): 15:51 EST = 20:51 UTC = 05:51 KST
     now_utc = datetime.now(timezone.utc)
-    is_weekday = now_utc.weekday() < 5                 # 월~금 (0~4)
-    is_buy_minute = (now_utc.hour == 19 and now_utc.minute == 51)  # 19시 51분
+    now_et = now_utc.astimezone(US_EASTERN)
+    et_tz_name = now_et.tzname() or "ET"
+    target_utc_hour = (DAILY_CHECK_ET_HOUR - int(now_et.utcoffset().total_seconds() // 3600)) % 24
+    target_kst_hour = (target_utc_hour + 9) % 24
+    schedule_desc = (
+        f"평일 {DAILY_CHECK_ET_HOUR:02d}:{DAILY_CHECK_ET_MINUTE:02d} {et_tz_name} "
+        f"({target_utc_hour:02d}:{DAILY_CHECK_ET_MINUTE:02d} UTC / {target_kst_hour:02d}:{DAILY_CHECK_ET_MINUTE:02d} KST)"
+    )
+
+    is_weekday = now_et.weekday() < 5                 # 미국 정규장 기준 월~금 (0~4)
+    is_buy_minute = (now_et.hour == DAILY_CHECK_ET_HOUR and now_et.minute == DAILY_CHECK_ET_MINUTE)
     force_buy = os.environ.get("FORCE_BUY_CHECK", "0") == "1"
     is_daily_buy_turn = (is_weekday and is_buy_minute) or force_buy
 
@@ -1614,7 +1628,7 @@ def 매수매도프로세스(exchange, symbol, stock_code, default_invest_money)
     if not is_daily_buy_turn:
         if not has_active_stage2_rounds(stock_code):
             print(
-                f"[매도/매수 스킵] 현재 2단계 진입 차수가 없으며 일일 점검 시간(평일 19:51 UTC, 현재 {now_utc.strftime('%H:%M')} UTC)이 아니므로 다음 날 점검 시점까지 대기합니다."
+                f"[매도/매수 스킵] 현재 2단계 진입 차수가 없으며 일일 점검 시간({schedule_desc}, 현재 {now_et.strftime('%H:%M')} {et_tz_name} / {now_utc.strftime('%H:%M')} UTC)이 아니므로 다음 날 점검 시점까지 대기합니다."
             )
             return
 
@@ -1632,12 +1646,12 @@ def 매수매도프로세스(exchange, symbol, stock_code, default_invest_money)
         # 매도 메시지와 매수 메시지 순차 전송 시 텔레그램 수신 순서 보장을 위해 2초 대기
         time.sleep(2)
 
-    # 4. [일일 매수 체크] : 평일 19:51 (UTC, 미국 장 마감 10분 전) 턴에만 실행!
+    # 4. [일일 매수 체크] : 미국 장 마감 10분 전(평일 15:51 ET) 턴에만 실행!
     if is_daily_buy_turn:
-        print(f"[일일 매수 실행] 평일 19:51 UTC (현재: {now_utc.strftime('%H:%M:%S')} UTC) 매수 조건을 점검합니다.")
+        print(f"[일일 매수 실행] {schedule_desc} (현재: {now_et.strftime('%H:%M:%S')} {et_tz_name} / {now_utc.strftime('%H:%M:%S')} UTC) 매수 조건을 점검합니다.")
         매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv)
     else:
-        print(f"[매수 스킵] 현재 시각({now_utc.strftime('%H:%M')} UTC)은 매수 시간(평일 19:51 UTC)이 아니므로 매수를 건너뜁니다.")
+        print(f"[매수 스킵] 현재 시각({now_et.strftime('%H:%M')} {et_tz_name} / {now_utc.strftime('%H:%M')} UTC)은 매수 시간({schedule_desc})이 아니므로 매수를 건너뜁니다.")
 
 
 def 전략_1회실행():
