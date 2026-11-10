@@ -173,6 +173,36 @@ def usdt_to_amount(exchange, symbol, usdt_amount, price):
         raise RuntimeError("주문수량이 0 이하입니다.")
     return amount
 
+def split_stage1_sell_quantity(exchange, symbol, total_qty, current_price, ratio=0.5):
+    """
+    1단계 목표가 통과 시 보유 수량을 ratio(기본 50%)만큼 분할 익절하기 위해
+    1차 매도 수량(part1_qty)과 2단계 잔여 수량(rem_qty)을 거래소 정밀도에 맞게 계산합니다.
+    최소 주문 수량(min_amt) 또는 최소 주문 금액(5 USDT) 미만이어서 분할이 불가능한 경우
+    (0.0, float(total_qty), False)를 반환합니다.
+    """
+    try:
+        market = exchange.market(symbol)
+        min_amt = market.get("limits", {}).get("amount", {}).get("min")
+        min_cost = market.get("limits", {}).get("cost", {}).get("min") or 5.0
+    except Exception:
+        min_amt = None
+        min_cost = 5.0
+
+    total_qty_f = float(total_qty)
+    raw_part1 = total_qty_f * float(ratio)
+    part1_qty = float(exchange.amount_to_precision(symbol, raw_part1))
+    rem_qty = float(exchange.amount_to_precision(symbol, max(0.0, total_qty_f - part1_qty)))
+
+    if part1_qty <= 0 or rem_qty <= 0:
+        return 0.0, total_qty_f, False
+    if min_amt is not None and (part1_qty < float(min_amt) or rem_qty < float(min_amt)):
+        return 0.0, total_qty_f, False
+    if float(current_price) > 0:
+        if (part1_qty * float(current_price) < float(min_cost)) or (rem_qty * float(current_price) < float(min_cost)):
+            return 0.0, total_qty_f, False
+
+    return part1_qty, rem_qty, True
+
 def price_to_precision(exchange, symbol, price):
     return float(exchange.price_to_precision(symbol, price))
 
@@ -276,7 +306,7 @@ def 체결가_조회(exchange, symbol, order_result, fallback_price, fallback_qt
 def get_trend_ma_status(exchange, symbol):
     """
     비트겟 무기한선물 TREND_TIMEFRAME봉 기준
-    직전 '완성봉(index -2)'의 종가가 TREND_MA_PERIOD MA 아래로 꺾였는지 판정.
+    직전 '완성봉(index -2)'의 종가가 TREND_MA_PERIOD MA 대비 노이즈 방지 버퍼(TREND_MA_BUFFER_PCT) 아래로 꺾였는지 판정.
     반환: (is_broken, prev_close, ma_val)
     """
     try:
@@ -286,17 +316,25 @@ def get_trend_ma_status(exchange, symbol):
             print(f"[{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA] 데이터 부족 ({len(ohlcv) if ohlcv else 0}개 수신, 최소 {min_candles}개 필요)")
             return False, 0.0, 0.0
 
-        df_4h = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df_4h["close"] = pd.to_numeric(df_4h["close"], errors="coerce")
+        df_candle = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_candle["close"] = pd.to_numeric(df_candle["close"], errors="coerce")
 
         # index -1 은 현재 실시간 진행 중인 미완성 캔들이므로 직전 완성봉(index -2) 기준 판정
         # 직전 완성봉 포함 최근 TREND_MA_PERIOD개 완성봉 구간
-        completed_n = df_4h["close"].iloc[-(TREND_MA_PERIOD + 1):-1]
+        completed_n = df_candle["close"].iloc[-(TREND_MA_PERIOD + 1):-1]
         ma_val = float(completed_n.mean())
-        prev_close = float(df_4h["close"].iloc[-2])
+        prev_close = float(df_candle["close"].iloc[-2])
 
-        is_broken = prev_close < ma_val
-        print(f"[{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 분석] 직전완성봉 종가={prev_close:.4f}, {TREND_MA_PERIOD}MA={ma_val:.4f}, 꺾임(이탈)={is_broken}")
+        # 낮 시간대(미국 정규장 외) 횡보 노이즈로 인한 오작동 매도 방지를 위해 소폭 하단 버퍼 적용
+        buf_pct = float(TREND_MA_BUFFER_PCT)
+        buf_ratio = (buf_pct / 100.0) if buf_pct >= 0.05 else max(0.0, buf_pct)
+        ma_break_line = ma_val * (1.0 - buf_ratio)
+
+        is_broken = prev_close < ma_break_line
+        print(
+            f"[{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 분석] 직전완성봉 종가={prev_close:.4f}, "
+            f"{TREND_MA_PERIOD}MA={ma_val:.4f}, 이탈기준선(-{buf_ratio*100:.2f}%)={ma_break_line:.4f}, 꺾임(이탈)={is_broken}"
+        )
         return is_broken, prev_close, ma_val
     except Exception as e:
         print(f"[{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 조회 에러] {e}")
@@ -391,28 +429,41 @@ def sync_round_state_from_excel(df, stock_code):
                 qty = float(row["수량"])
                 target_price = buy_price * (1.0 + SELL_PROFIT_PCT)
 
-                # 기존 차수 상태(stage, preservation_line, stage2_entered_at)를 (매수가, 수량) 기준으로 매칭하여 보존
+                # 기존 차수 상태(stage, preservation_line, stage2_entered_at 및 1단계 50% 분할익절 정보)를 (매수가, 수량) 기준으로 매칭하여 보존
                 matched_prev = None
                 old_key = str(old_r_num)
                 if old_key in prev_rounds and old_key not in used_prev_keys:
                     p_info = prev_rounds[old_key]
-                    if abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and abs(float(p_info.get("quantity", 0.0)) - qty) < 0.02:
+                    p_init_qty = float(p_info.get("initial_quantity", p_info.get("quantity", 0.0)) or 0.0)
+                    p_rem_qty = float(p_info.get("quantity", 0.0) or 0.0)
+                    if abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and (abs(p_init_qty - qty) < 0.02 or abs(p_rem_qty - qty) < 0.02):
                         matched_prev = p_info
                         used_prev_keys.add(old_key)
                 if matched_prev is None:
                     for pk, p_info in prev_rounds.items():
                         if pk in used_prev_keys:
                             continue
-                        if abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and abs(float(p_info.get("quantity", 0.0)) - qty) < 0.02:
+                        p_init_qty = float(p_info.get("initial_quantity", p_info.get("quantity", 0.0)) or 0.0)
+                        p_rem_qty = float(p_info.get("quantity", 0.0) or 0.0)
+                        if abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and (abs(p_init_qty - qty) < 0.02 or abs(p_rem_qty - qty) < 0.02):
                             matched_prev = p_info
                             used_prev_keys.add(pk)
                             break
 
                 if matched_prev is not None:
+                    prev_stage = int(matched_prev.get("stage", 1))
+                    prev_part1_qty = float(matched_prev.get("part1_sold_qty", 0.0) or 0.0)
+                    prev_rem_qty = float(matched_prev.get("quantity", qty) or qty)
+                    effective_qty = prev_rem_qty if (prev_stage == 2 and prev_part1_qty > 0) else qty
                     new_rounds[r_key] = {
-                        "stage": int(matched_prev.get("stage", 1)),
+                        "stage": prev_stage,
                         "buy_price": buy_price,
-                        "quantity": qty,
+                        "initial_quantity": float(matched_prev.get("initial_quantity", qty) or qty),
+                        "quantity": effective_qty,
+                        "part1_sold_qty": prev_part1_qty,
+                        "part1_sold_price": matched_prev.get("part1_sold_price", None),
+                        "part1_sold_pct": matched_prev.get("part1_sold_pct", None),
+                        "part1_sold_at": matched_prev.get("part1_sold_at", None),
                         "target_price": target_price,
                         "preservation_line": float(matched_prev.get("preservation_line", target_price)),
                         "stage2_entered_at": matched_prev.get("stage2_entered_at", None),
@@ -421,7 +472,12 @@ def sync_round_state_from_excel(df, stock_code):
                     new_rounds[r_key] = {
                         "stage": 1,
                         "buy_price": buy_price,
+                        "initial_quantity": qty,
                         "quantity": qty,
+                        "part1_sold_qty": 0.0,
+                        "part1_sold_price": None,
+                        "part1_sold_pct": None,
+                        "part1_sold_at": None,
                         "target_price": target_price,
                         "preservation_line": target_price,
                         "stage2_entered_at": None,
@@ -438,7 +494,20 @@ def sync_round_state_from_excel(df, stock_code):
     save_round_state(state)
     return state
 
-def update_round_stage(stock_code, round_number, stage, preservation_line=None, target_price=None, buy_price=None, quantity=None):
+def update_round_stage(
+    stock_code,
+    round_number,
+    stage,
+    preservation_line=None,
+    target_price=None,
+    buy_price=None,
+    quantity=None,
+    initial_quantity=None,
+    part1_sold_qty=None,
+    part1_sold_price=None,
+    part1_sold_pct=None,
+    part1_sold_at=None,
+):
     state = load_round_state()
     rounds = state.setdefault(stock_code, {}).setdefault("rounds", {})
     r_key = str(int(round_number))
@@ -453,6 +522,16 @@ def update_round_stage(stock_code, round_number, stage, preservation_line=None, 
         r_info["buy_price"] = float(buy_price)
     if quantity is not None:
         r_info["quantity"] = float(quantity)
+    if initial_quantity is not None:
+        r_info["initial_quantity"] = float(initial_quantity)
+    if part1_sold_qty is not None:
+        r_info["part1_sold_qty"] = float(part1_sold_qty)
+    if part1_sold_price is not None:
+        r_info["part1_sold_price"] = float(part1_sold_price)
+    if part1_sold_pct is not None:
+        r_info["part1_sold_pct"] = float(part1_sold_pct)
+    if part1_sold_at is not None:
+        r_info["part1_sold_at"] = str(part1_sold_at)
     if stage == 2 and not r_info.get("stage2_entered_at"):
         r_info["stage2_entered_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -508,13 +587,31 @@ ADJ_DIVISOR = 7.0
 SELL_FEE_RATE = 0.0006  # 0.06%
 
 # =========================
-# ✅ 2단계 추세추종 설정 (상승 추세 판정 기준)
+# ✅ 2단계 추세추종 및 1차 분할익절 설정
 # =========================
-TREND_TIMEFRAME = "4h"               # 추세 판정 캔들 시간프레임 (예: "1h", "4h", "1d")
+TREND_TIMEFRAME = "1h"               # 추세 판정 캔들 시간프레임 (SOXL 변동성 대응: "4h" → "1h" 적용)
 TREND_MA_PERIOD = 5                  # 이동평균선 기간 (예: 5 → 5MA, 10 → 10MA)
 TREND_OHLCV_LIMIT = 10               # 추세 판정용 OHLCV 조회 캔들 수
+TREND_MA_BUFFER_PCT = 0.003          # ★ 낮 시간대(장외 횡보) 1h 5MA 노이즈 방지용 소폭 버퍼 (0.003 = 0.3%: 완성봉 종가 < 5MA × 0.997 일 때 이탈 판정)
 PRESERVATION_LINE_MULTIPLIER = 0.998  # 보존선 방어 매도 계수 (현재가 ≤ 보존선 × 이 값이면 매도)
+STAGE1_PARTIAL_SELL_PCT = 50         # ★ 1차 목표가 통과 시 즉시 분할익절할 비율(%) — 여기서 자유롭게 조정하세요!
+                                     #   (예: 50 → 50% 익절 후 50% 2단계, 30 → 30% 익절 후 70% 2단계, 0 → 분할 없이 100% 2단계, 100 → 100% 즉시 전량 익절)
+                                     #   ※ 50(백분율) 또는 0.50(비율) 모두 자동 인식합니다.
 STAGE2_BRIEFING_INTERVAL_HOURS = 4   # 2단계 진입 차수 보유 시 정기 브리핑 발송 간격 (시간 단위)
+
+def get_stage1_partial_sell_config():
+    """
+    STAGE1_PARTIAL_SELL_PCT 설정값을 읽어 (비율 0.0~1.0, 1차익절_%문자열, 잔여_%문자열, 1차익절_%수치)를 반환합니다.
+    예: STAGE1_PARTIAL_SELL_PCT = 50 (또는 0.5) -> (0.5, "50%", "50%", 50.0)
+    """
+    raw = float(STAGE1_PARTIAL_SELL_PCT)
+    ratio = (raw / 100.0) if raw > 1.0 else raw
+    ratio = max(0.0, min(1.0, ratio))
+    pct_val = round(ratio * 100.0, 1)
+    rem_val = round(100.0 - pct_val, 1)
+    pct_str = f"{int(pct_val)}%" if pct_val.is_integer() else f"{pct_val:.1f}%"
+    rem_str = f"{int(rem_val)}%" if rem_val.is_integer() else f"{rem_val:.1f}%"
+    return ratio, pct_str, rem_str, pct_val
 
 # =========================
 # ✅ 데이터 재시도 설정
@@ -1107,6 +1204,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
     current_price = get_current_futures_price(exchange, symbol)
     today = datetime.now(KST).date()
     sell_orders = []
+    partial_sell_events = []
 
     current_invest_money = 투자금시트_초기화_및_불러오기(stock_code, default_invest_money)
     highest_price_30d = 과거_고점찾기(stock_code, ohlcv)
@@ -1130,15 +1228,19 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
             continue
 
         buy_price = float(row["매수가"])
-        quantity = float(row["수량"])
+        excel_quantity = float(row["수량"])
         round_number = int(row["차수"])
         target_price = buy_price * (1.0 + SELL_PROFIT_PCT)
         max_hold_days = MAX_HOLD_DAYS_HIGH_DROP if row["고점대비하락조건"] else MAX_HOLD_DAYS_NORMAL
 
         r_key = str(round_number)
         r_info = rounds_dict.get(r_key, {})
-        current_stage = r_info.get("stage", 1)
+        current_stage = int(r_info.get("stage", 1))
         preservation_line = float(r_info.get("preservation_line", target_price))
+        initial_quantity = float(r_info.get("initial_quantity", excel_quantity) or excel_quantity)
+        part1_sold_qty = float(r_info.get("part1_sold_qty", 0.0) or 0.0)
+        part1_sold_price = r_info.get("part1_sold_price", None)
+        quantity = float(r_info.get("quantity", excel_quantity) or excel_quantity) if (current_stage == 2 and part1_sold_qty > 0) else excel_quantity
 
         # 1) 타임컷 우선 체크 (일일 매수 점검 전 하루 1번 확인)
         if is_daily_buy_turn and (today - buy_date).days >= max_hold_days:
@@ -1149,46 +1251,174 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                 f"⚠️ 떨사오팔 일반 전략 {stock_code} {round_number}차 강제 매도 알림\n"
                 f"🔹 사유: 보유기간 경과({max_hold_days}일)\n"
                 f"📅 매수일: {buy_date} | 오늘: {today}\n"
-                f"📊 보유 수량: {quantity}주\n"
+                f"📊 매도 대상 수량: {quantity}주\n"
             )
             telegram_alert.SendMessage(msg)
             continue
 
-        # 2) 1단계: 1차 목표가 감시 (일일 매수 점검 전 하루 1번만 2단계 진입 여부 확인)
+        # 2) 1단계: 1차 목표가 감시 (일일 매수 점검 전 하루 1번만 확인)
         if current_stage == 1:
             if is_daily_buy_turn:
                 if current_price >= target_price:
-                    updated_info = update_round_stage(stock_code, round_number, stage=2, preservation_line=target_price, target_price=target_price, buy_price=buy_price, quantity=quantity)
-                    rounds_dict[r_key] = updated_info
-                    print(f"{stock_code} {round_number}차 1차 목표가 돌파 -> 2단계(추세추종) 승격!")
-                    msg = (
-                        f"🎯 [1차 목표가 돌파] {stock_code} {round_number}차 2단계 승격\n"
-                        f"🔹 진입 단계: [2단계 추세 추종 모드]\n"
-                        f"📈 1차 목표가: {target_price:.2f} (수익률 +{SELL_PROFIT_PCT*100:.1f}%)\n"
-                        f"💲 현재가: {current_price:.2f}\n"
-                        f"🛡️ 최소 이익 보존선: {target_price:.2f}\n"
-                        f"💡 {TREND_TIMEFRAME}봉 {TREND_MA_PERIOD}MA 꺾임 시 초과 익절 또는 보존선 하향 터치({PRESERVATION_LINE_MULTIPLIER}) 시 즉시 방어 매도합니다."
+                    part1_ratio, part1_pct_str, rem_pct_str, part1_pct_val = get_stage1_partial_sell_config()
+
+                    # [방식 1] 1단계 통과 시점에 이미 4h 5MA가 꺾여 있거나(is_ma5_broken == True),
+                    # STAGE1_PARTIAL_SELL_PCT가 100%로 설정된 경우 즉시 100% 전량 익절
+                    if is_ma5_broken or part1_ratio >= 1.0:
+                        reason_str = (
+                            f"1차 목표가 도달 + {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 하회 전량 익절(완성봉 {prev_close_4h:.2f} < {TREND_MA_PERIOD}MA {ma5_4h:.2f})"
+                            if is_ma5_broken
+                            else f"1차 목표가 도달 ({part1_pct_str} 전량 익절 설정)"
+                        )
+                        print(f"{stock_code} {round_number}차 {reason_str} -> 100% 전량 즉시 익절!")
+                        sell_orders.append((
+                            index,
+                            quantity,
+                            current_price * 0.98,
+                            reason_str,
+                            buy_price,
+                            buy_date,
+                            round_number,
+                        ))
+                        continue
+
+                    # 4h 5MA 상승 추세가 살아있는 경우: 설정 비율(STAGE1_PARTIAL_SELL_PCT)만큼 즉시 분할익절 + 나머지는 최저보존선(1차 목표가) 기준으로 2단계 승격
+                    part1_qty, rem_qty, can_split = (
+                        split_stage1_sell_quantity(exchange, symbol, quantity, current_price, ratio=part1_ratio)
+                        if part1_ratio > 0.0
+                        else (0.0, float(quantity), False)
                     )
-                    telegram_alert.SendMessage(msg)
+                    if can_split:
+                        p_order, p_order_price = place_close_long(exchange, symbol, part1_qty)
+                        print(f"[1단계 {part1_pct_str} 분할매도 주문 ({round_number}차)]", p_order)
+
+                        fallback_part1 = float(p_order_price) if p_order_price is not None else float(current_price)
+                        p_order_id = p_order.get("id") if isinstance(p_order, dict) else None
+                        if p_order_id:
+                            p_filled_ok, _ = wait_order_filled(exchange, p_order_id, symbol)
+                            if not p_filled_ok and USE_LIMIT_ORDER:
+                                cancel_order_safe(exchange, p_order_id, symbol)
+                                telegram_alert.SendMessage(
+                                    f"⚠️ 떨사오팔(Bitget) {stock_code} {round_number}차 1단계 {part1_pct_str} 분할매도 지정가 미체결 → 취소"
+                                )
+                                continue
+
+                        real_part1_price, real_part1_qty, _ = 체결가_조회(
+                            exchange, symbol, p_order, fallback_part1, part1_qty
+                        )
+                        rem_qty = float(exchange.amount_to_precision(symbol, max(0.0, float(quantity) - float(real_part1_qty))))
+                        now_kst_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+                        updated_info = update_round_stage(
+                            stock_code,
+                            round_number,
+                            stage=2,
+                            preservation_line=target_price,
+                            target_price=target_price,
+                            buy_price=buy_price,
+                            quantity=rem_qty,
+                            initial_quantity=initial_quantity,
+                            part1_sold_qty=real_part1_qty,
+                            part1_sold_price=real_part1_price,
+                            part1_sold_pct=part1_pct_val,
+                            part1_sold_at=now_kst_str,
+                        )
+                        rounds_dict[r_key] = updated_info
+                        partial_sell_events.append((round_number, real_part1_qty, real_part1_price, rem_qty))
+
+                        part1_net_sell = float(real_part1_price) * (1.0 - SELL_FEE_RATE)
+                        part1_profit_pct = ((part1_net_sell / buy_price) - 1.0) * 100.0 if buy_price > 0 else 0.0
+                        part1_pnl = (part1_net_sell - buy_price) * float(real_part1_qty)
+                        part1_fee = float(real_part1_price) * float(real_part1_qty) * SELL_FEE_RATE
+
+                        print(
+                            f"{stock_code} {round_number}차 1차 목표가 돌파 -> {part1_pct_str}({real_part1_qty}주 @ {real_part1_price:.4f}) 분할익절 완료 & 잔여 {rem_pct_str}({rem_qty}주) 2단계(추세추종) 승격!"
+                        )
+                        msg = (
+                            f"🎯 [1차 목표가 돌파 & {part1_pct_str} 분할익절] {stock_code} {round_number}차 2단계 승격\n"
+                            f"🔹 1차 익절({part1_pct_str}): {real_part1_qty}주 체결 (체결가 {real_part1_price:.4f} / 수익률 {part1_profit_pct:+.2f}%)\n"
+                            f"🔹 잔여 물량({rem_pct_str}): {rem_qty}주 → [2단계 추세 추종 모드 진입]\n"
+                            f"📉 매수가: {buy_price:.2f} | 📈 1차 목표가: {target_price:.2f} (+{SELL_PROFIT_PCT*100:.1f}%)\n"
+                            f"💲 현재가: {current_price:.2f} | 📊 {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA: {ma5_4h:.2f}\n"
+                            f"🛡️ 잔여 {rem_pct_str} 최저보존선: {target_price:.2f} (1차 목표 매도가)\n"
+                            f"💡 잔여 {rem_pct_str}는 {TREND_TIMEFRAME}봉 {TREND_MA_PERIOD}MA 꺾임 시 초과 익절 또는 보존선 하향 터치({PRESERVATION_LINE_MULTIPLIER}) 시 즉시 방어 매도합니다."
+                        )
+                        telegram_alert.SendMessage(msg)
+
+                        sheet_logger.log_trade(
+                            action="SELL",
+                            symbol=symbol,
+                            level=f"{round_number}차(1/2)",
+                            price=real_part1_price,
+                            amount=real_part1_qty,
+                            fee=part1_fee,
+                            pnl=part1_pnl,
+                            pnl_pct=part1_profit_pct,
+                            close_all=False,
+                            note=f"1단계 목표가 돌파 {part1_pct_str} 분할익절 (잔여 {rem_qty}주 2단계 승격, 보존선 {target_price:.2f})",
+                        )
+                    else:
+                        updated_info = update_round_stage(
+                            stock_code,
+                            round_number,
+                            stage=2,
+                            preservation_line=target_price,
+                            target_price=target_price,
+                            buy_price=buy_price,
+                            quantity=quantity,
+                            initial_quantity=initial_quantity,
+                        )
+                        rounds_dict[r_key] = updated_info
+                        skip_note = "(분할익절 0% 설정)" if part1_ratio <= 0.0 else "(최소주문금액 제약으로 분할 생략)"
+                        print(f"{stock_code} {round_number}차 1차 목표가 돌파 {skip_note} -> 전량 2단계(추세추종) 승격!")
+                        msg = (
+                            f"🎯 [1차 목표가 돌파] {stock_code} {round_number}차 2단계 승격\n"
+                            f"🔹 진입 단계: [2단계 추세 추종 모드 {skip_note}]\n"
+                            f"📈 1차 목표가: {target_price:.2f} (수익률 +{SELL_PROFIT_PCT*100:.1f}%)\n"
+                            f"💲 현재가: {current_price:.2f}\n"
+                            f"🛡️ 최소 이익 보존선: {target_price:.2f}\n"
+                            f"💡 {TREND_TIMEFRAME}봉 {TREND_MA_PERIOD}MA 꺾임 시 초과 익절 또는 보존선 하향 터치({PRESERVATION_LINE_MULTIPLIER}) 시 즉시 방어 매도합니다."
+                        )
+                        telegram_alert.SendMessage(msg)
                 else:
                     print(f"{stock_code} {round_number}차 1단계 일일 점검: 현재가 {current_price:.2f} < 목표가 {target_price:.2f} (2단계 미진입)")
             else:
                 print(f"{stock_code} {round_number}차 1단계 대기 중 (일일 점검 시점에만 2단계 진입 확인)")
 
-        # 3) 2단계: 추세추종 (시나리오 ② 보존선 방어 or 시나리오 ① 4h 5MA 이탈)
+        # 3) 2단계: 추세추종 (남은 잔여 물량에 대해 시나리오 ② 보존선 방어 or 시나리오 ① 이평선 이탈 모두 적용)
         elif current_stage == 2:
             # 시나리오 ②: 최소 이익 보존선 방어 매도 (현재가 <= 보존선 * 0.998)
             if current_price <= preservation_line * PRESERVATION_LINE_MULTIPLIER:
                 print(f"{stock_code} {round_number}차 보존선 방어 매도 조건 충족: 현재가 {current_price:.2f} <= {preservation_line * PRESERVATION_LINE_MULTIPLIER:.2f}")
                 sell_orders.append((index, quantity, current_price * 0.98, f"최소 이익 보존선 방어(보존선 {preservation_line:.2f} × {PRESERVATION_LINE_MULTIPLIER} 대비 하향 터치)", buy_price, buy_date, round_number))
-            # 시나리오 ①: 추세 꺾임 익절 (4시간봉 5MA 이탈)
+            # 시나리오 ①: 추세 꺾임 익절 (TREND_TIMEFRAME TREND_MA_PERIOD MA 버퍼 기준 이탈)
             elif is_ma5_broken:
-                print(f"{stock_code} {round_number}차 추세 꺾임 익절 조건 충족: 4시간봉 종가 {prev_close_4h:.2f} < 5MA {ma5_4h:.2f}")
-                sell_orders.append((index, quantity, current_price * 0.98, f"추세 꺾임 익절(4시간봉 완성봉 {prev_close_4h:.2f} < 5MA {ma5_4h:.2f})", buy_price, buy_date, round_number))
+                _buf_p = float(TREND_MA_BUFFER_PCT)
+                _buf_r = (_buf_p / 100.0) if _buf_p >= 0.05 else max(0.0, _buf_p)
+                _ma_cut = ma5_4h * (1.0 - _buf_r)
+                print(
+                    f"{stock_code} {round_number}차 추세 꺾임 익절 조건 충족: "
+                    f"{TREND_TIMEFRAME}봉 종가 {prev_close_4h:.2f} < {TREND_MA_PERIOD}MA 버퍼기준 {_ma_cut:.2f} (원본MA {ma5_4h:.2f})"
+                )
+                sell_orders.append((
+                    index,
+                    quantity,
+                    current_price * 0.98,
+                    f"추세 꺾임 익절({TREND_TIMEFRAME}봉 완성봉 {prev_close_4h:.2f} < {TREND_MA_PERIOD}MA 버퍼기준 {_ma_cut:.2f})",
+                    buy_price,
+                    buy_date,
+                    round_number,
+                ))
             else:
-                print(f"{stock_code} {round_number}차 2단계 홀딩 중 (현재가 {current_price:.2f} > 보존선 {preservation_line:.2f}, {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 상승 추세 유지)")
+                print(f"{stock_code} {round_number}차 2단계 홀딩 중 (잔여 {quantity}주 | 현재가 {current_price:.2f} > 보존선 {preservation_line:.2f}, {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 상승 추세 유지)")
 
     for index, quantity, sell_price, sell_reason, buy_price, buy_date, round_number in sell_orders:
+        r_key = str(round_number)
+        r_info_before = rounds_dict.get(r_key, {})
+        part1_qty_done = float(r_info_before.get("part1_sold_qty", 0.0) or 0.0)
+        part1_price_done = r_info_before.get("part1_sold_price", None)
+        part1_pct_done = r_info_before.get("part1_sold_pct", None)
+
         # ✅ 주문은 Bitget 선물 (청산), 엑셀엔 실체결값 저장
         order, order_price = place_close_long(exchange, symbol, quantity)
         print("[매도주문]", order)
@@ -1206,16 +1436,29 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         real_sell_price, real_sell_qty, _ = 체결가_조회(exchange, symbol, order, fallback_sell, quantity)
         quantity = real_sell_qty
 
-        df.at[index, "매도가"] = real_sell_price
-        df.at[index, "매도일"] = datetime.now(KST).strftime("%Y-%m-%d")
-        df.at[index, "매도수량"] = real_sell_qty
-
         try:
             buy_price_f = float(buy_price)
         except Exception:
             buy_price_f = float(pd.to_numeric(pd.Series([buy_price]), errors="coerce").iloc[0])
 
-        sell_price_f = float(real_sell_price)
+        # 1차 분할익절 이력이 있는 차수인 경우: 1차분 + 2차분 가중평균 매도가 및 총 수량으로 엑셀 완결 및 복리 1회 반영
+        has_part1 = (part1_qty_done > 0 and part1_price_done is not None and float(part1_price_done) > 0)
+        if has_part1:
+            p1_f = float(part1_price_done)
+            q1_f = float(part1_qty_done)
+            p2_f = float(real_sell_price)
+            q2_f = float(real_sell_qty)
+            total_sold_qty = q1_f + q2_f
+            avg_sell_price = ((p1_f * q1_f) + (p2_f * q2_f)) / total_sold_qty if total_sold_qty > 0 else p2_f
+        else:
+            total_sold_qty = float(real_sell_qty)
+            avg_sell_price = float(real_sell_price)
+
+        df.at[index, "매도가"] = avg_sell_price
+        df.at[index, "매도일"] = datetime.now(KST).strftime("%Y-%m-%d")
+        df.at[index, "매도수량"] = total_sold_qty
+
+        sell_price_f = float(avg_sell_price)
         net_sell = sell_price_f * (1.0 - SELL_FEE_RATE)
 
         if buy_price_f is None or pd.isna(buy_price_f) or buy_price_f <= 0:
@@ -1244,41 +1487,68 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         if highest_price_30d and highest_price_30d > 0:
             drop_rate = (highest_price_30d - current_price) / highest_price_30d * 100.0
 
-        msg = (
-            f"📌 떨사오팔 일반전략 {stock_code} {df.at[index, '차수']}차 매도 발생\n"
-            f"🔹 매도 사유: {sell_reason}\n"
-            f"📉 매수가(기록): {buy_price_f:.2f}\n"
-            f"📈 매도가(Bitget 체결): {sell_price_f:.4f}\n"
-            f"📊 매도 수량: {quantity}주\n"
-            f"📅 매수일: {buy_date}\n"
-            f"📅 매도일: {datetime.now(KST).strftime('%Y-%m-%d')}\n"
-            f"💸 매도수수료: 0.06% (매도만)\n"
-            f"✅ 수익률(수수료반영): {profit_pct:.2f}%\n"
-            f"✅ 조정률(수익률/{int(ADJ_DIVISOR)}×가중치 {weight}): {adj_pct:.2f}%\n"
-            f"💰 다음 투자금(종목별, 정수): {next_invest_money}\n"
-            f"📊 고점 대비 낙폭률(현재가 기준): {drop_rate:.2f}%"
-        )
+        if has_part1:
+            _, default_p1_str, default_rem_str, default_p1_val = get_stage1_partial_sell_config()
+            p1_val = float(part1_pct_done) if part1_pct_done is not None else default_p1_val
+            r2_val = round(100.0 - p1_val, 1)
+            p1_label = f"{int(p1_val)}%" if p1_val.is_integer() else f"{p1_val:.1f}%"
+            r2_label = f"{int(r2_val)}%" if r2_val.is_integer() else f"{r2_val:.1f}%"
+
+            part2_net_sell = float(real_sell_price) * (1.0 - SELL_FEE_RATE)
+            part2_profit_pct = ((part2_net_sell / buy_price_f) - 1.0) * 100.0 if buy_price_f > 0 else 0.0
+            msg = (
+                f"📌 떨사오팔 일반전략 {stock_code} {df.at[index, '차수']}차 2단계 잔여({r2_label}) 최종 매도 완료\n"
+                f"🔹 매도 사유: {sell_reason}\n"
+                f"📉 매수가(기록): {buy_price_f:.2f}\n"
+                f"📈 1차({p1_label}) 기익절: {part1_qty_done}주 @ {float(part1_price_done):.4f}\n"
+                f"📈 2차({r2_label}) 금회체결: {quantity}주 @ {float(real_sell_price):.4f} ({part2_profit_pct:+.2f}%)\n"
+                f"📊 합산 평균매도가: {sell_price_f:.4f} (총 {total_sold_qty}주 완판)\n"
+                f"📅 매수일: {buy_date} | 📅 매도완결일: {datetime.now(KST).strftime('%Y-%m-%d')}\n"
+                f"💸 매도수수료: 0.06% (매도만)\n"
+                f"✅ 최종 합산 수익률(수수료반영): {profit_pct:.2f}%\n"
+                f"✅ 조정률(수익률/{int(ADJ_DIVISOR)}×가중치 {weight}): {adj_pct:.2f}%\n"
+                f"💰 다음 투자금(종목별, 정수): {next_invest_money}\n"
+                f"📊 고점 대비 낙폭률(현재가 기준): {drop_rate:.2f}%"
+            )
+        else:
+            msg = (
+                f"📌 떨사오팔 일반전략 {stock_code} {df.at[index, '차수']}차 매도 발생\n"
+                f"🔹 매도 사유: {sell_reason}\n"
+                f"📉 매수가(기록): {buy_price_f:.2f}\n"
+                f"📈 매도가(Bitget 체결): {sell_price_f:.4f}\n"
+                f"📊 매도 수량: {quantity}주\n"
+                f"📅 매수일: {buy_date}\n"
+                f"📅 매도일: {datetime.now(KST).strftime('%Y-%m-%d')}\n"
+                f"💸 매도수수료: 0.06% (매도만)\n"
+                f"✅ 수익률(수수료반영): {profit_pct:.2f}%\n"
+                f"✅ 조정률(수익률/{int(ADJ_DIVISOR)}×가중치 {weight}): {adj_pct:.2f}%\n"
+                f"💰 다음 투자금(종목별, 정수): {next_invest_money}\n"
+                f"📊 고점 대비 낙폭률(현재가 기준): {drop_rate:.2f}%"
+            )
         telegram_alert.SendMessage(msg)
 
         # [구글 시트 체결 기록 전송 추가]
-        real_pnl = (net_sell - buy_price_f) * quantity  # 실현 손익 (USDT)
-        fee_usdt = real_sell_price * quantity * 0.0006  # 매도 수수료 (USDT)
+        part2_net = float(real_sell_price) * (1.0 - SELL_FEE_RATE)
+        real_pnl = (part2_net - buy_price_f) * float(quantity)  # 금회 체결분 실현 손익 (USDT)
+        fee_usdt = float(real_sell_price) * float(quantity) * SELL_FEE_RATE  # 금회 체결분 매도 수수료 (USDT)
+        part2_pct = ((part2_net / buy_price_f) - 1.0) * 100.0 if buy_price_f > 0 else 0.0
         sheet_logger.log_trade(
             action="SELL",
             symbol=symbol,
-            level=f"{df.at[index, '차수']}차",
+            level=f"{df.at[index, '차수']}차(2/2)" if has_part1 else f"{df.at[index, '차수']}차",
             price=real_sell_price,
             amount=quantity,
             fee=fee_usdt,
             pnl=real_pnl,
-            pnl_pct=profit_pct,
-            note=f"{sell_reason} (조정률 {adj_pct:+.2f}%)"
+            pnl_pct=part2_pct if has_part1 else profit_pct,
+            close_all=True,
+            note=f"{sell_reason} (합산수익률 {profit_pct:.2f}%, 조정률 {adj_pct:+.2f}%)" if has_part1 else f"{sell_reason} (조정률 {adj_pct:+.2f}%)"
         )
 
     if sell_orders:
         # 매도(강제매도/익절) 발생으로 빈 차수가 생기면 남은 미매도 차수들을 매수가 내림차순으로 1차부터 순서대로 앞당김
         state = sync_round_state_from_excel(df, stock_code)
-    else:
+    elif not partial_sell_events:
         remaining = 0 if stock_data.empty else len(stock_data[pd.isna(stock_data["매도가"])])
         now_et = datetime.now(US_EASTERN)
 
@@ -1306,7 +1576,11 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
                     t_price = b_price * (1.0 + SELL_PROFIT_PCT)
                     r_key = str(r_num)
-                    r_stage = rounds_dict.get(r_key, {}).get("stage", 1)
+                    r_state_info = rounds_dict.get(r_key, {})
+                    r_stage = r_state_info.get("stage", 1)
+                    r_pres_line = float(r_state_info.get("preservation_line", t_price))
+                    r_part1_qty = float(r_state_info.get("part1_sold_qty", 0.0) or 0.0)
+                    r_part1_pct = r_state_info.get("part1_sold_pct", None)
 
                     r_max_hold_days = MAX_HOLD_DAYS_HIGH_DROP if bool(r_row.get("고점대비하락조건", False)) else MAX_HOLD_DAYS_NORMAL
                     force_sell_str = ""
@@ -1321,9 +1595,20 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                         pass
 
                     if r_stage == 2:
-                        ma_str = f"{ma5_4h:.2f}(2단계 진입)" if ma5_4h > 0 else f"{t_price:.2f}(2단계 진입)"
+                        if r_part1_qty > 0:
+                            _, _, def_rem_str, def_p1_val = get_stage1_partial_sell_config()
+                            p1_v = float(r_part1_pct) if r_part1_pct is not None else def_p1_val
+                            rem_v = round(100.0 - p1_v, 1)
+                            rem_lbl = f"{int(rem_v)}%" if rem_v.is_integer() else f"{rem_v:.1f}%"
+                            stage2_tag = f"2단계 잔여{rem_lbl}"
+                        else:
+                            stage2_tag = "2단계 진입"
+                        _bp = float(TREND_MA_BUFFER_PCT)
+                        _br = (_bp / 100.0) if _bp >= 0.05 else max(0.0, _bp)
+                        _ma_disp = ma5_4h * (1.0 - _br) if ma5_4h > 0 else 0.0
+                        ma_str = f"{_ma_disp:.2f}({stage2_tag})" if _ma_disp > 0 else f"{r_pres_line:.2f}({stage2_tag})"
                         rounds_detail_lines.append(
-                            f"  • {r_num}차: {ma_str} (매수가 {b_price:.2f}, 보존선 {t_price:.2f}{force_sell_str})"
+                            f"  • {r_num}차: {ma_str} (매수가 {b_price:.2f}, 보존선 {r_pres_line:.2f}{force_sell_str})"
                         )
                     else:
                         rounds_detail_lines.append(
@@ -1389,12 +1674,14 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                 "ma5_4h": round(float(ma5_4h), 4),
                 "timeframe": TREND_TIMEFRAME,
                 "ma_period": TREND_MA_PERIOD,
+                "ma_buffer_pct": TREND_MA_BUFFER_PCT,
+                "stage1_partial_sell_pct": STAGE1_PARTIAL_SELL_PCT,
             },
             "rounds": latest_rounds,
         }, strategy_name="떨사오팔")
     except Exception as e:
         print(f"⚠️ [STATE_SYNC] 떨사오팔 상태 동기화 오류(무시): {e}")
-    return sell_orders
+    return sell_orders or partial_sell_events
 
 
 # =========================
@@ -1428,7 +1715,9 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
         preservation_line=target_price,
         target_price=target_price,
         buy_price=float(buy_price),
-        quantity=float(quantity)
+        quantity=float(quantity),
+        initial_quantity=float(quantity),
+        part1_sold_qty=0.0,
     )
     sync_round_state_from_excel(df, stock_code)
     print(f"{stock_code} {round_number}차 매수 기록 및 상태(1단계) 등록 완료 - 매수가: {buy_price}, 수량: {quantity}, 고점대비하락조건: {high_drop_condition}")
@@ -1573,6 +1862,8 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
                     "ma5_4h": round(float(ma5_4h), 4),
                     "timeframe": TREND_TIMEFRAME,
                     "ma_period": TREND_MA_PERIOD,
+                    "ma_buffer_pct": TREND_MA_BUFFER_PCT,
+                    "stage1_partial_sell_pct": STAGE1_PARTIAL_SELL_PCT,
                 },
                 "rounds": latest_rounds,
             }, strategy_name="떨사오팔")

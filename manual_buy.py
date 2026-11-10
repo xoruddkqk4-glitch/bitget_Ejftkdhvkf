@@ -279,7 +279,20 @@ def save_round_state(state):
     except Exception as e:
         print(f"[상태파일 저장 실패] {e}")
 
-def update_round_stage(stock_code, round_number, stage, preservation_line=None, target_price=None, buy_price=None, quantity=None):
+def update_round_stage(
+    stock_code,
+    round_number,
+    stage,
+    preservation_line=None,
+    target_price=None,
+    buy_price=None,
+    quantity=None,
+    initial_quantity=None,
+    part1_sold_qty=None,
+    part1_sold_price=None,
+    part1_sold_pct=None,
+    part1_sold_at=None,
+):
     state = load_round_state()
     rounds = state.setdefault(stock_code, {}).setdefault("rounds", {})
     r_key = str(int(round_number))
@@ -294,6 +307,16 @@ def update_round_stage(stock_code, round_number, stage, preservation_line=None, 
         r_info["buy_price"] = float(buy_price)
     if quantity is not None:
         r_info["quantity"] = float(quantity)
+    if initial_quantity is not None:
+        r_info["initial_quantity"] = float(initial_quantity)
+    if part1_sold_qty is not None:
+        r_info["part1_sold_qty"] = float(part1_sold_qty)
+    if part1_sold_price is not None:
+        r_info["part1_sold_price"] = float(part1_sold_price)
+    if part1_sold_pct is not None:
+        r_info["part1_sold_pct"] = float(part1_sold_pct)
+    if part1_sold_at is not None:
+        r_info["part1_sold_at"] = str(part1_sold_at)
     if stage == 2 and not r_info.get("stage2_entered_at"):
         r_info["stage2_entered_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -425,7 +448,9 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
         preservation_line=target_price,
         target_price=target_price,
         buy_price=float(buy_price),
-        quantity=float(quantity)
+        quantity=float(quantity),
+        initial_quantity=float(quantity),
+        part1_sold_qty=0.0,
     )
     print(f"✅ {stock_code} {round_number}차 매수 기록 및 상태(1단계) 등록 완료 (매수가: {buy_price}, 수량: {quantity})")
 
