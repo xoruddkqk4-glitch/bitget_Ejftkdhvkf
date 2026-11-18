@@ -92,6 +92,9 @@ SELL_PROFIT_PCT = 0.025          # 매수 후 +2.5% 목표가
 HIGH_DROP_THRESHOLD = 0.40       # 고점 대비 -40% 하락 시 대폭락 판정
 HIGH_DROP_INVEST_MULTIPLIER = 1.5 # 대폭락 시 매수금 1.5배 증액
 LOOKBACK_DAYS = 40               # 고점 탐색 기간
+MAX_ACTIVE_ROUNDS = 15           # 최대 동시 보유 허용 차수 (초과 시 기본 매수 보류)
+HEAVY_HOLD_ROUND_THRESHOLD = 10  # 다차수 과부하 기준 (10개 이상 보유 시 매수 하락 기준 강화)
+HEAVY_HOLD_BUY_DROP_PCT = 0.030  # 다차수 과부하 구간 시가 대비 하락 매수 기준 (-3.0%)
 DATA_RETRY_COUNT = 5
 DATA_RETRY_SLEEP_SEC = 4
 
@@ -292,9 +295,21 @@ def update_round_stage(
     part1_sold_price=None,
     part1_sold_pct=None,
     part1_sold_at=None,
+    buy_date=None,
+    part1_pool_saved_ratio=None,
+    rescue_mode=None,
+    deep_loss_seen=None,
+    rescue_stage2=None,
+    offset_sold_qty=None,
+    offset_sold_proceeds=None,
+    offset_used_usdt=None,
+    offset_count=None,
 ):
     state = load_round_state()
-    rounds = state.setdefault(stock_code, {}).setdefault("rounds", {})
+    stock_dict = state.setdefault(stock_code, {})
+    stock_dict.setdefault("offset_pool_usdt", 0.0)
+    stock_dict.setdefault("offset_total_used_usdt", 0.0)
+    rounds = stock_dict.setdefault("rounds", {})
     r_key = str(int(round_number))
     r_info = rounds.setdefault(r_key, {})
 
@@ -317,6 +332,24 @@ def update_round_stage(
         r_info["part1_sold_pct"] = float(part1_sold_pct)
     if part1_sold_at is not None:
         r_info["part1_sold_at"] = str(part1_sold_at)
+    if buy_date is not None:
+        r_info["buy_date"] = str(buy_date)
+    if part1_pool_saved_ratio is not None:
+        r_info["part1_pool_saved_ratio"] = float(part1_pool_saved_ratio)
+    if rescue_mode is not None:
+        r_info["rescue_mode"] = bool(rescue_mode)
+    if deep_loss_seen is not None:
+        r_info["deep_loss_seen"] = bool(deep_loss_seen)
+    if rescue_stage2 is not None:
+        r_info["rescue_stage2"] = bool(rescue_stage2)
+    if offset_sold_qty is not None:
+        r_info["offset_sold_qty"] = float(offset_sold_qty)
+    if offset_sold_proceeds is not None:
+        r_info["offset_sold_proceeds"] = float(offset_sold_proceeds)
+    if offset_used_usdt is not None:
+        r_info["offset_used_usdt"] = float(offset_used_usdt)
+    if offset_count is not None:
+        r_info["offset_count"] = int(offset_count)
     if stage == 2 and not r_info.get("stage2_entered_at"):
         r_info["stage2_entered_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -415,13 +448,19 @@ def 과거_고점찾기(stock_code, ohlcv=None):
         recent_ohlcv = ohlcv
     return float(recent_ohlcv["close"].max())
 
-def 가능다음차수(stock_data):
-    for round_num in range(1, 40):
-        if round_num not in stock_data["차수"].values or (
-            round_num in stock_data["차수"].values and pd.notna(stock_data.loc[stock_data["차수"] == round_num, "매도가"]).all()
-        ):
-            return round_num
-    return 1
+def 가능다음차수(stock_data, allow_overflow=False):
+    """
+    빈 차수 없이 1~N차 앞당김 + 맨 뒤 차수 추가 방식(메인 봇과 통일):
+    - 미매도 보유 개수가 MAX_ACTIVE_ROUNDS 미만이면 active_cnt + 1 반환
+    - allow_overflow=True(--force 강제 매수 시)면 상한 초과 시에도 active_cnt + 1 반환
+    """
+    if stock_data is None or stock_data.empty:
+        return 1
+    active_rows = stock_data[stock_data["매도가"].isna()]
+    active_cnt = len(active_rows)
+    if active_cnt < MAX_ACTIVE_ROUNDS or allow_overflow:
+        return active_cnt + 1
+    return None
 
 def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condition):
     df = 매매기록불러오기()
@@ -451,6 +490,15 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
         quantity=float(quantity),
         initial_quantity=float(quantity),
         part1_sold_qty=0.0,
+        buy_date=buy_date,
+        part1_pool_saved_ratio=0.0,
+        rescue_mode=False,
+        deep_loss_seen=False,
+        rescue_stage2=False,
+        offset_sold_qty=0.0,
+        offset_sold_proceeds=0.0,
+        offset_used_usdt=0.0,
+        offset_count=0,
     )
     print(f"✅ {stock_code} {round_number}차 매수 기록 및 상태(1단계) 등록 완료 (매수가: {buy_price}, 수량: {quantity})")
 
@@ -634,15 +682,30 @@ def execute_manual_buy(check_only: bool = False, force: bool = False):
     # 1. 엑셀 데이터 및 다음 차수 확인
     df = 매매기록불러오기()
     stock_data = df[df["종목"] == stock_code] if not df.empty else pd.DataFrame()
-    next_round = 가능다음차수(stock_data) if not stock_data.empty else 1
+    active_cnt = len(stock_data[stock_data["매도가"].isna()]) if not stock_data.empty else 0
+    next_round = 가능다음차수(stock_data, allow_overflow=force) if not stock_data.empty else 1
+    if next_round is None and not force:
+        msg = (
+            f"⏸️ [수동 매수 보류 - 최대 차수 제한] {stock_code}\n"
+            f"🔹 현재 미매도 보유 차수({active_cnt}개)가 최대 상한({MAX_ACTIVE_ROUNDS}개)에 도달했습니다.\n"
+            f"💡 강제로 추가 매수하려면 `python manual_buy.py --force` 를 사용하세요."
+        )
+        print(f"\n⚠️ 최대 보유 차수({MAX_ACTIVE_ROUNDS}개) 도달로 매수를 보류합니다. (강제 집행: --force)")
+        telegram_alert.SendMessage(msg)
+        return
+    if force and active_cnt >= MAX_ACTIVE_ROUNDS:
+        print(f"\n⚠️ [경고] 최대 보유 차수 상한({MAX_ACTIVE_ROUNDS}개)에 도달했으나 --force 옵션으로 {next_round}차 강제 진행합니다.")
+
     base_invest_money = 투자금시트_초기화_및_불러오기(stock_code, INITIAL_INVEST_USDT)
 
     # 2. 시세 데이터 조회
     current_price, open_price, futures_price, ohlcv = get_market_prices(stock_code, exchange, symbol)
     highest_price = 과거_고점찾기(stock_code, ohlcv)
 
-    # 3. 매수 조건 계산
-    target_buy_threshold = open_price * (1.0 - BUY_DROP_PCT)
+    # 3. 매수 조건 계산 (다차수 과부하 시 -3.0% 강화 적용)
+    is_heavy_hold = active_cnt >= HEAVY_HOLD_ROUND_THRESHOLD
+    effective_buy_drop_pct = HEAVY_HOLD_BUY_DROP_PCT if is_heavy_hold else BUY_DROP_PCT
+    target_buy_threshold = open_price * (1.0 - effective_buy_drop_pct)
     drop_pct_from_open = ((current_price - open_price) / open_price) * 100.0
     high_drop_condition = ((highest_price - current_price) / highest_price >= HIGH_DROP_THRESHOLD) if highest_price else False
     high_drop_rate = ((highest_price - current_price) / highest_price * 100.0) if highest_price else 0.0
@@ -658,10 +721,11 @@ def execute_manual_buy(check_only: bool = False, force: bool = False):
     # 상태 브리핑 출력
     print(f"\n📊 [시세 및 조건 분석 보고]")
     print(f"  • 대상 종목: {stock_code} (선물 심볼: {symbol})")
+    print(f"  • 현재 미매도차수: {active_cnt}개 / 상한 {MAX_ACTIVE_ROUNDS}개 {'(과부하 방어 -3.0% 적용)' if is_heavy_hold else ''}")
     print(f"  • 다음 진입 차수: {next_round}차")
     print(f"  • 당일 시가(Open): {open_price:.4f} USD")
     print(f"  • 현재가(Price)  : {current_price:.4f} USD (시가대비: {drop_pct_from_open:+.2f}%)")
-    print(f"  • 매수 기준가    : {target_buy_threshold:.4f} USD (시가 -{BUY_DROP_PCT*100:.1f}%)")
+    print(f"  • 매수 기준가    : {target_buy_threshold:.4f} USD (시가 -{effective_buy_drop_pct*100:.1f}%)")
     print(f"  • 40일 최고가    : {highest_price:.4f} USD (낙폭: {high_drop_rate:.2f}%)")
     print(f"  • 대폭락 증액조건: {'충족 (1.5배 증액)' if high_drop_condition else '미충족 (기본금액)'}")
     print(f"  • 필요 투자금    : 약 {adjusted_investment:.1f} USDT (기본 {base_invest_money} USDT)")
@@ -679,7 +743,7 @@ def execute_manual_buy(check_only: bool = False, force: bool = False):
             f"⏸️ [수동 매수 보류] {stock_code} 매수 조건 미충족\n"
             f"🔹 현재 진입 예정 차수: {next_round}차\n"
             f"📈 당일 시가: {open_price:.2f} | 💲 현재가: {current_price:.2f}\n"
-            f"🎯 매수 기준가: {target_buy_threshold:.2f} (시가 대비 -{BUY_DROP_PCT*100:.1f}%)\n"
+            f"🎯 매수 기준가: {target_buy_threshold:.2f} (시가 대비 -{effective_buy_drop_pct*100:.1f}%)\n"
             f"📊 현재 변동률: {drop_pct_from_open:+.2f}%\n"
             f"💡 강제로 매수하시려면 `python manual_buy.py --force` 를 사용하세요."
         )
