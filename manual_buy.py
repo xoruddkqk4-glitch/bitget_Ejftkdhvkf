@@ -304,6 +304,7 @@ def update_round_stage(
     offset_sold_proceeds=None,
     offset_used_usdt=None,
     offset_count=None,
+    is_dummy=None,
 ):
     state = load_round_state()
     stock_dict = state.setdefault(stock_code, {})
@@ -350,6 +351,8 @@ def update_round_stage(
         r_info["offset_used_usdt"] = float(offset_used_usdt)
     if offset_count is not None:
         r_info["offset_count"] = int(offset_count)
+    if is_dummy is not None:
+        r_info["is_dummy"] = bool(is_dummy)
     if stage == 2 and not r_info.get("stage2_entered_at"):
         r_info["stage2_entered_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -398,31 +401,46 @@ def 투자금시트_초기화_및_불러오기(stock_code, default_invest_money)
         invest_val = int(default_invest_money)
     return int(invest_val)
 
+def _to_bool_safe(v):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    try:
+        if pd.isna(v):
+            return False
+    except Exception:
+        pass
+    if isinstance(v, (int, float)):
+        return bool(int(v))
+    s = str(v).strip().lower()
+    return s in ("true", "t", "1", "y", "yes")
+
 def 매매기록불러오기():
     try:
         wb = load_workbook(FILENAME, read_only=True)
         sheet_name = "매매기록" if "매매기록" in wb.sheetnames else 0
+        wb.close()
         df = pd.read_excel(FILENAME, engine="openpyxl", sheet_name=sheet_name)
         if "매도일" in df.columns:
             df["매도일"] = df["매도일"].astype(str)
         if "날짜" in df.columns:
             df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce").dt.strftime("%Y-%m-%d")
         if "고점대비하락조건" in df.columns:
-            def _to_bool(v):
-                if isinstance(v, bool): return v
-                if v is None: return False
-                s = str(v).strip().lower()
-                return s in ("true", "t", "1", "y", "yes")
-            df["고점대비하락조건"] = df["고점대비하락조건"].apply(_to_bool)
+            df["고점대비하락조건"] = df["고점대비하락조건"].apply(_to_bool_safe)
+        if "더미여부" in df.columns:
+            df["더미여부"] = df["더미여부"].apply(_to_bool_safe)
     except FileNotFoundError:
-        df = pd.DataFrame(columns=["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량"])
+        df = pd.DataFrame(columns=["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량", "더미여부"])
     except Exception:
-        df = pd.DataFrame(columns=["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량"])
+        df = pd.DataFrame(columns=["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량", "더미여부"])
     return df
 
 def 매매기록저장(df):
     if "매도일" in df.columns:
         df["매도일"] = df["매도일"].astype(str)
+    if "더미여부" in df.columns:
+        df["더미여부"] = df["더미여부"].apply(_to_bool_safe)
     if os.path.exists(FILENAME):
         wb = load_workbook(FILENAME)
         if "매매기록" not in wb.sheetnames:
@@ -434,7 +452,7 @@ def 매매기록저장(df):
         wb = Workbook()
         ws = wb.active
         ws.title = "매매기록"
-        ws.append(["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량"])
+        ws.append(["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량", "더미여부"])
         wb.save(FILENAME)
         with pd.ExcelWriter(FILENAME, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
             df.to_excel(writer, index=False, sheet_name="매매기록")
@@ -474,9 +492,11 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
         "고점대비하락조건": high_drop_condition,
         "매도가": None,
         "매도일": None,
-        "매도수량": None
+        "매도수량": None,
+        "더미여부": False,
     }
     df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
+    df["더미여부"] = df["더미여부"].apply(_to_bool_safe)
     매매기록저장(df)
 
     target_price = float(buy_price) * (1.0 + SELL_PROFIT_PCT)
@@ -499,6 +519,7 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
         offset_sold_proceeds=0.0,
         offset_used_usdt=0.0,
         offset_count=0,
+        is_dummy=False,
     )
     print(f"✅ {stock_code} {round_number}차 매수 기록 및 상태(1단계) 등록 완료 (매수가: {buy_price}, 수량: {quantity})")
 
@@ -682,12 +703,21 @@ def execute_manual_buy(check_only: bool = False, force: bool = False):
     # 1. 엑셀 데이터 및 다음 차수 확인
     df = 매매기록불러오기()
     stock_data = df[df["종목"] == stock_code] if not df.empty else pd.DataFrame()
-    active_cnt = len(stock_data[stock_data["매도가"].isna()]) if not stock_data.empty else 0
+    active_rows = stock_data[stock_data["매도가"].isna()] if not stock_data.empty else pd.DataFrame()
+    active_cnt = len(active_rows)
+    if not active_rows.empty and "더미여부" in active_rows.columns:
+        _dum_mask = active_rows["더미여부"].apply(_to_bool_safe)
+        dummy_cnt = int(_dum_mask.sum())
+        real_cnt = int((~_dum_mask).sum())
+    else:
+        dummy_cnt = 0
+        real_cnt = active_cnt
+    hold_breakdown = f" (실매수 {real_cnt} / 더미 {dummy_cnt})" if dummy_cnt > 0 else ""
     next_round = 가능다음차수(stock_data, allow_overflow=force) if not stock_data.empty else 1
     if next_round is None and not force:
         msg = (
             f"⏸️ [수동 매수 보류 - 최대 차수 제한] {stock_code}\n"
-            f"🔹 현재 미매도 보유 차수({active_cnt}개)가 최대 상한({MAX_ACTIVE_ROUNDS}개)에 도달했습니다.\n"
+            f"🔹 현재 미매도 보유 차수({active_cnt}개{hold_breakdown})가 최대 상한({MAX_ACTIVE_ROUNDS}개)에 도달했습니다.\n"
             f"💡 강제로 추가 매수하려면 `python manual_buy.py --force` 를 사용하세요."
         )
         print(f"\n⚠️ 최대 보유 차수({MAX_ACTIVE_ROUNDS}개) 도달로 매수를 보류합니다. (강제 집행: --force)")
@@ -721,7 +751,7 @@ def execute_manual_buy(check_only: bool = False, force: bool = False):
     # 상태 브리핑 출력
     print(f"\n📊 [시세 및 조건 분석 보고]")
     print(f"  • 대상 종목: {stock_code} (선물 심볼: {symbol})")
-    print(f"  • 현재 미매도차수: {active_cnt}개 / 상한 {MAX_ACTIVE_ROUNDS}개 {'(과부하 방어 -3.0% 적용)' if is_heavy_hold else ''}")
+    print(f"  • 현재 미매도차수: {active_cnt}개{hold_breakdown} / 상한 {MAX_ACTIVE_ROUNDS}개 {'(과부하 방어 -3.0% 적용)' if is_heavy_hold else ''}")
     print(f"  • 다음 진입 차수: {next_round}차")
     print(f"  • 당일 시가(Open): {open_price:.4f} USD")
     print(f"  • 현재가(Price)  : {current_price:.4f} USD (시가대비: {drop_pct_from_open:+.2f}%)")

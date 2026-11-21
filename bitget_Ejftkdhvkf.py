@@ -173,6 +173,22 @@ def usdt_to_amount(exchange, symbol, usdt_amount, price):
         raise RuntimeError("주문수량이 0 이하입니다.")
     return amount
 
+def _safe_dummy_amount(exchange, symbol, usdt_amount, price):
+    """더미 매수 가상 수량 산출 (최소주문 수량 미달 시에도 정밀도 폴백으로 안전 기록)."""
+    try:
+        return float(usdt_to_amount(exchange, symbol, usdt_amount, price))
+    except Exception:
+        raw_amount = (float(usdt_amount) / float(price)) if float(price) > 0 else 0.0
+        if raw_amount <= 0:
+            return 0.0001
+        try:
+            amt = float(exchange.amount_to_precision(symbol, raw_amount))
+            if amt > 0:
+                return amt
+        except Exception:
+            pass
+        return max(0.0001, round(raw_amount, 4))
+
 def split_stage1_sell_quantity(exchange, symbol, total_qty, current_price, ratio=0.5):
     """
     1단계 목표가 통과 시 보유 수량을 ratio(기본 50%)만큼 분할 익절하기 위해
@@ -401,6 +417,23 @@ def _safe_nonneg_float(val, default=0.0):
     except Exception:
         return float(default)
 
+def _to_bool_safe(val):
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    try:
+        if pd.isna(val):
+            return False
+    except Exception:
+        pass
+    if isinstance(val, (int, float)):
+        return bool(int(val))
+    s = str(val).strip().lower()
+    if s in ("true", "t", "1", "y", "yes"):
+        return True
+    return False
+
 def get_offset_pool(stock_code) -> float:
     state = load_round_state()
     return _safe_nonneg_float(state.get(stock_code, {}).get("offset_pool_usdt", 0.0), 0.0)
@@ -467,6 +500,7 @@ def sync_round_state_from_excel(df, stock_code):
                 buy_price = float(row["매수가"])
                 qty = float(row["수량"])
                 target_price = buy_price * (1.0 + SELL_PROFIT_PCT)
+                is_dummy = _to_bool_safe(row.get("더미여부", False))
 
                 raw_date = row.get("날짜", None)
                 if isinstance(raw_date, pd.Timestamp):
@@ -477,17 +511,18 @@ def sync_round_state_from_excel(df, stock_code):
                 else:
                     buy_date_str = ""
 
-                excel_offset_qty = _safe_nonneg_float(row.get("구제상계수량", 0.0), 0.0)
-                excel_offset_proceeds = _safe_nonneg_float(row.get("구제상계금액", 0.0), 0.0)
+                excel_offset_qty = 0.0 if is_dummy else _safe_nonneg_float(row.get("구제상계수량", 0.0), 0.0)
+                excel_offset_proceeds = 0.0 if is_dummy else _safe_nonneg_float(row.get("구제상계금액", 0.0), 0.0)
 
-                # 기존 차수 상태를 (매수가, 수량) 기준으로 매칭하여 보존
+                # 기존 차수 상태를 (매수가, 수량, 더미여부) 기준으로 매칭하여 보존
                 matched_prev = None
                 old_key = str(old_r_num)
                 if old_key in prev_rounds and old_key not in used_prev_keys:
                     p_info = prev_rounds[old_key]
                     p_init_qty = float(p_info.get("initial_quantity", p_info.get("quantity", 0.0)) or 0.0)
                     p_rem_qty = float(p_info.get("quantity", 0.0) or 0.0)
-                    if abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and (abs(p_init_qty - qty) < 0.02 or abs(p_rem_qty - qty) < 0.02):
+                    p_is_dummy = bool(p_info.get("is_dummy", False))
+                    if p_is_dummy == is_dummy and abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and (abs(p_init_qty - qty) < 0.02 or abs(p_rem_qty - qty) < 0.02):
                         matched_prev = p_info
                         used_prev_keys.add(old_key)
                 if matched_prev is None:
@@ -496,7 +531,8 @@ def sync_round_state_from_excel(df, stock_code):
                             continue
                         p_init_qty = float(p_info.get("initial_quantity", p_info.get("quantity", 0.0)) or 0.0)
                         p_rem_qty = float(p_info.get("quantity", 0.0) or 0.0)
-                        if abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and (abs(p_init_qty - qty) < 0.02 or abs(p_rem_qty - qty) < 0.02):
+                        p_is_dummy = bool(p_info.get("is_dummy", False))
+                        if p_is_dummy == is_dummy and abs(float(p_info.get("buy_price", 0.0)) - buy_price) < 0.05 and (abs(p_init_qty - qty) < 0.02 or abs(p_rem_qty - qty) < 0.02):
                             matched_prev = p_info
                             used_prev_keys.add(pk)
                             break
@@ -505,17 +541,32 @@ def sync_round_state_from_excel(df, stock_code):
                     prev_stage = int(matched_prev.get("stage", 1))
                     init_qty = float(matched_prev.get("initial_quantity", qty) or qty)
                     prev_part1_qty = float(matched_prev.get("part1_sold_qty", 0.0) or 0.0)
-                    json_offset_qty = float(matched_prev.get("offset_sold_qty", 0.0) or 0.0)
-                    prev_offset_qty = max(json_offset_qty, excel_offset_qty)
-                    prev_offset_proceeds = max(float(matched_prev.get("offset_sold_proceeds", 0.0) or 0.0), excel_offset_proceeds)
-                    calc_rem = round(max(0.0, init_qty - prev_part1_qty - prev_offset_qty), 8)
-                    if prev_part1_qty > 0 or prev_offset_qty > 0:
-                        if matched_prev.get("quantity") is not None and excel_offset_qty <= json_offset_qty + 1e-8:
-                            effective_qty = float(matched_prev.get("quantity", calc_rem))
+                    if is_dummy:
+                        prev_offset_qty = 0.0
+                        prev_offset_proceeds = 0.0
+                        prev_pool_saved_ratio = 0.0
+                        prev_offset_used = 0.0
+                        prev_offset_cnt = 0
+                        calc_rem = round(max(0.0, init_qty - prev_part1_qty), 8)
+                        if prev_part1_qty > 0:
+                            effective_qty = float(matched_prev.get("quantity", calc_rem)) if matched_prev.get("quantity") is not None else calc_rem
                         else:
-                            effective_qty = calc_rem
+                            effective_qty = qty
                     else:
-                        effective_qty = qty
+                        json_offset_qty = float(matched_prev.get("offset_sold_qty", 0.0) or 0.0)
+                        prev_offset_qty = max(json_offset_qty, excel_offset_qty)
+                        prev_offset_proceeds = max(float(matched_prev.get("offset_sold_proceeds", 0.0) or 0.0), excel_offset_proceeds)
+                        prev_pool_saved_ratio = float(matched_prev.get("part1_pool_saved_ratio", 0.0) or 0.0)
+                        prev_offset_used = float(matched_prev.get("offset_used_usdt", 0.0) or 0.0)
+                        prev_offset_cnt = int(matched_prev.get("offset_count", 0) or 0)
+                        calc_rem = round(max(0.0, init_qty - prev_part1_qty - prev_offset_qty), 8)
+                        if prev_part1_qty > 0 or prev_offset_qty > 0:
+                            if matched_prev.get("quantity") is not None and excel_offset_qty <= json_offset_qty + 1e-8:
+                                effective_qty = float(matched_prev.get("quantity", calc_rem))
+                            else:
+                                effective_qty = calc_rem
+                        else:
+                            effective_qty = qty
 
                     prev_rescue_stage2 = bool(matched_prev.get("rescue_stage2", False))
                     prev_target = float(matched_prev.get("target_price", target_price) or target_price)
@@ -523,6 +574,7 @@ def sync_round_state_from_excel(df, stock_code):
 
                     new_rounds[r_key] = {
                         "stage": prev_stage,
+                        "is_dummy": is_dummy,
                         "buy_date": buy_date_str or str(matched_prev.get("buy_date", "") or ""),
                         "buy_price": buy_price,
                         "initial_quantity": init_qty,
@@ -531,7 +583,7 @@ def sync_round_state_from_excel(df, stock_code):
                         "part1_sold_price": matched_prev.get("part1_sold_price", None),
                         "part1_sold_pct": matched_prev.get("part1_sold_pct", None),
                         "part1_sold_at": matched_prev.get("part1_sold_at", None),
-                        "part1_pool_saved_ratio": float(matched_prev.get("part1_pool_saved_ratio", 0.0) or 0.0),
+                        "part1_pool_saved_ratio": prev_pool_saved_ratio,
                         "target_price": prev_target if prev_rescue_stage2 else target_price,
                         "preservation_line": prev_pres,
                         "stage2_entered_at": matched_prev.get("stage2_entered_at", None),
@@ -540,11 +592,11 @@ def sync_round_state_from_excel(df, stock_code):
                         "rescue_stage2": prev_rescue_stage2,
                         "offset_sold_qty": prev_offset_qty,
                         "offset_sold_proceeds": prev_offset_proceeds,
-                        "offset_used_usdt": float(matched_prev.get("offset_used_usdt", 0.0) or 0.0),
-                        "offset_count": int(matched_prev.get("offset_count", 0) or 0),
+                        "offset_used_usdt": prev_offset_used,
+                        "offset_count": prev_offset_cnt,
                     }
                 else:
-                    rem_qty = round(max(0.0, qty - excel_offset_qty), 8)
+                    rem_qty = qty if is_dummy else round(max(0.0, qty - excel_offset_qty), 8)
                     init_rescue = False
                     if buy_date_str and not ENABLE_HARD_TIMECUT:
                         try:
@@ -556,6 +608,7 @@ def sync_round_state_from_excel(df, stock_code):
                             pass
                     new_rounds[r_key] = {
                         "stage": 1,
+                        "is_dummy": is_dummy,
                         "buy_date": buy_date_str,
                         "buy_price": buy_price,
                         "initial_quantity": qty,
@@ -571,10 +624,10 @@ def sync_round_state_from_excel(df, stock_code):
                         "rescue_mode": init_rescue,
                         "deep_loss_seen": False,
                         "rescue_stage2": False,
-                        "offset_sold_qty": excel_offset_qty,
-                        "offset_sold_proceeds": excel_offset_proceeds,
+                        "offset_sold_qty": 0.0 if is_dummy else excel_offset_qty,
+                        "offset_sold_proceeds": 0.0 if is_dummy else excel_offset_proceeds,
                         "offset_used_usdt": 0.0,
-                        "offset_count": 1 if excel_offset_qty > 0 else 0,
+                        "offset_count": 0 if is_dummy else (1 if excel_offset_qty > 0 else 0),
                     }
 
         stock_dict["rounds"] = new_rounds
@@ -610,6 +663,7 @@ def update_round_stage(
     offset_sold_proceeds=None,
     offset_used_usdt=None,
     offset_count=None,
+    is_dummy=None,
 ):
     state = load_round_state()
     stock_dict = state.setdefault(stock_code, {})
@@ -656,6 +710,8 @@ def update_round_stage(
         r_info["offset_used_usdt"] = float(offset_used_usdt)
     if offset_count is not None:
         r_info["offset_count"] = int(offset_count)
+    if is_dummy is not None:
+        r_info["is_dummy"] = bool(is_dummy)
     if stage == 2 and not r_info.get("stage2_entered_at"):
         r_info["stage2_entered_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -998,7 +1054,7 @@ def 투자금시트_초기화_및_불러오기(stock_code, default_invest_money)
 
         ws_trade = wb.active
         ws_trade.title = "매매기록"
-        ws_trade.append(["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량"])
+        ws_trade.append(["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량", "더미여부"])
 
         ws = wb.create_sheet(INVEST_SHEET_NAME)
         ws.append(["종목", "투자금", "업데이트일", "마지막수익률(%)", "조정률(%)", "다음투자금"])
@@ -1077,7 +1133,9 @@ def 투자금시트_업데이트(stock_code, new_invest_money, last_profit_pct, 
 def 매매기록불러오기():
     try:
         wb = load_workbook(FILENAME, read_only=True)
-        if "매매기록" in wb.sheetnames:
+        has_trade_sheet = "매매기록" in wb.sheetnames
+        wb.close()
+        if has_trade_sheet:
             df = pd.read_excel(FILENAME, engine="openpyxl", sheet_name="매매기록")
         else:
             df = pd.read_excel(FILENAME, engine="openpyxl", sheet_name=0)
@@ -1088,33 +1146,23 @@ def 매매기록불러오기():
             df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce").dt.strftime("%Y-%m-%d")
 
         if "고점대비하락조건" in df.columns:
-            def _to_bool(v):
-                if isinstance(v, bool):
-                    return v
-                if v is None:
-                    return False
-                if isinstance(v, (int, float)) and not pd.isna(v):
-                    return bool(int(v))
-                s = str(v).strip().lower()
-                if s in ("true", "t", "1", "y", "yes"):
-                    return True
-                if s in ("false", "f", "0", "n", "no", "", "none", "nan"):
-                    return False
-                return False
-
-            df["고점대비하락조건"] = df["고점대비하락조건"].apply(_to_bool)
+            df["고점대비하락조건"] = df["고점대비하락조건"].apply(_to_bool_safe)
+        if "더미여부" in df.columns:
+            df["더미여부"] = df["더미여부"].apply(_to_bool_safe)
 
     except FileNotFoundError:
         print("매매 기록 파일이 없습니다.")
-        df = pd.DataFrame(columns=["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량"])
+        df = pd.DataFrame(columns=["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량", "더미여부"])
     except Exception:
-        df = pd.DataFrame(columns=["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량"])
+        df = pd.DataFrame(columns=["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량", "더미여부"])
     return df
 
 
 def 매매기록저장(df):
     if "매도일" in df.columns:
         df["매도일"] = df["매도일"].astype(str)
+    if "더미여부" in df.columns:
+        df["더미여부"] = df["더미여부"].apply(_to_bool_safe)
 
     if os.path.exists(FILENAME):
         wb = load_workbook(FILENAME)
@@ -1129,7 +1177,7 @@ def 매매기록저장(df):
         wb = Workbook()
         ws_trade = wb.active
         ws_trade.title = "매매기록"
-        ws_trade.append(["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량"])
+        ws_trade.append(["차수", "날짜", "종목", "매수가", "수량", "고점대비하락조건", "매도가", "매도일", "매도수량", "더미여부"])
         wb.save(FILENAME)
 
         with pd.ExcelWriter(FILENAME, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
@@ -1148,7 +1196,7 @@ PNL_SHEET_NAME = "손익차트"
 
 
 def _실현손익_시리즈(df):
-    """매도 완료 건만 골라 매도일 기준 실현손익(USDT)을 계산한다."""
+    """매도 완료 건만 골라 매도일 기준 실현손익(USDT)을 계산한다 (더미 건 제외)."""
     if df is None or df.empty:
         return pd.DataFrame(columns=["매도일", "실현손익"])
 
@@ -1157,6 +1205,8 @@ def _실현손익_시리즈(df):
         return pd.DataFrame(columns=["매도일", "실현손익"])
 
     closed = closed[pd.notna(closed["매도가"])].copy()
+    if "더미여부" in closed.columns:
+        closed = closed[~closed["더미여부"].apply(_to_bool_safe)].copy()
     if closed.empty:
         return pd.DataFrame(columns=["매도일", "실현손익"])
 
@@ -1191,7 +1241,10 @@ def 손익차트시트_갱신(df=None):
     pnl_rows = _실현손익_시리즈(df)
     open_cnt = 0
     if df is not None and not df.empty and "매도가" in df.columns:
-        open_cnt = int(pd.isna(df["매도가"]).sum())
+        open_mask = pd.isna(df["매도가"])
+        if "더미여부" in df.columns:
+            open_mask = open_mask & (~df["더미여부"].apply(_to_bool_safe))
+        open_cnt = int(open_mask.sum())
 
     col_daily = "일일 실현손익(USDT)"
     col_cum = "누적 실현손익(USDT)"
@@ -1343,7 +1396,7 @@ def 가능다음차수(stock_data):
 
 # =========================
 def _has_rescue_waiting(rounds_map, exclude_rounds=None):
-    """구제 대기 상태(rescue_mode=True, stage=1, 잔여수량>0)인 차수가 존재하는지 확인합니다."""
+    """구제 대기 상태(rescue_mode=True, stage=1, 잔여수량>0, 실매수 한정)인 차수가 존재하는지 확인합니다."""
     excl = set()
     for er in (exclude_rounds or ()):
         try:
@@ -1356,6 +1409,8 @@ def _has_rescue_waiting(rounds_map, exclude_rounds=None):
         except Exception:
             rn = rk
         if rn in excl:
+            continue
+        if bool(rv.get("is_dummy", False)):
             continue
         if bool(rv.get("rescue_mode", False)) and int(rv.get("stage", 1)) == 1:
             if float(rv.get("quantity", 0.0) or 0.0) > 0:
@@ -1404,6 +1459,8 @@ def execute_offset_rescue(exchange, symbol, stock_code, df, current_price, curre
             r_num = int(row["차수"])
             r_key = str(r_num)
             r_info = rounds_dict.get(r_key, {})
+            if _to_bool_safe(row.get("더미여부", False)) or bool(r_info.get("is_dummy", False)):
+                continue
             if not bool(r_info.get("rescue_mode", False)):
                 continue
             if int(r_info.get("stage", 1)) != 1:
@@ -1673,6 +1730,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
         cur_deep = bool(pre_r_info.get("deep_loss_seen", False))
         cur_rescue = bool(pre_r_info.get("rescue_mode", False))
+        pre_is_dummy = _to_bool_safe(pre_row.get("더미여부", False)) or bool(pre_r_info.get("is_dummy", False))
         new_deep = cur_deep or (pre_buy_price > 0 and current_price <= pre_buy_price * (1.0 + RESCUE_REBOUND_TRIGGER_PCT))
         new_rescue = cur_rescue or ((not ENABLE_HARD_TIMECUT) and pre_stage == 1 and pre_held_days > pre_max_hold)
 
@@ -1683,6 +1741,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                 stage=pre_stage,
                 deep_loss_seen=new_deep,
                 rescue_mode=new_rescue,
+                is_dummy=pre_is_dummy,
             )
 
     for index, row in stock_data.iterrows():
@@ -1707,11 +1766,12 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
         r_key = str(round_number)
         r_info = rounds_dict.get(r_key, {})
+        is_dummy = _to_bool_safe(row.get("더미여부", False)) or bool(r_info.get("is_dummy", False))
         current_stage = int(r_info.get("stage", 1))
         preservation_line = float(r_info.get("preservation_line", target_price))
         initial_quantity = float(r_info.get("initial_quantity", excel_quantity) or excel_quantity)
         part1_sold_qty = float(r_info.get("part1_sold_qty", 0.0) or 0.0)
-        offset_sold_qty = float(r_info.get("offset_sold_qty", 0.0) or 0.0)
+        offset_sold_qty = 0.0 if is_dummy else float(r_info.get("offset_sold_qty", 0.0) or 0.0)
         if part1_sold_qty > 0 or offset_sold_qty > 0:
             calc_rem = max(0.0, initial_quantity - part1_sold_qty - offset_sold_qty)
             quantity = float(r_info.get("quantity", calc_rem) or calc_rem)
@@ -1722,14 +1782,15 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
         deep_loss_seen = bool(r_info.get("deep_loss_seen", False))
         rescue_stage2 = bool(r_info.get("rescue_stage2", False))
+        dummy_tag = "[더미] " if is_dummy else ""
 
         # 1) 강제 타임컷 체크 (ENABLE_HARD_TIMECUT=True 일 때만 동작; False 면 구제 모드로 전환)
         if ENABLE_HARD_TIMECUT and is_daily_buy_turn and held_days >= max_hold_days:
-            print(f"{stock_code} {round_number}차 떨사오팔 강제 매도 - {max_hold_days}일 경과")
-            sell_orders.append((index, quantity, current_price * 0.98, f"보유기간 경과({max_hold_days}일)", buy_price, buy_date, round_number, "HARD_TIMECUT"))
+            print(f"{stock_code} {round_number}차 {dummy_tag}떨사오팔 강제 매도 - {max_hold_days}일 경과")
+            sell_orders.append((index, quantity, current_price * 0.98, f"보유기간 경과({max_hold_days}일)", buy_price, buy_date, round_number, "HARD_TIMECUT", is_dummy))
 
             msg = (
-                f"⚠️ 떨사오팔 일반 전략 {stock_code} {round_number}차 강제 매도 알림\n"
+                f"{'👻⚠️ [더미] ' if is_dummy else '⚠️ '}떨사오팔 일반 전략 {stock_code} {round_number}차{'(더미)' if is_dummy else ''} 강제 매도 알림\n"
                 f"🔹 사유: 보유기간 경과({max_hold_days}일)\n"
                 f"📅 매수일: {buy_date} | 오늘: {today}\n"
                 f"📊 매도 대상 수량: {quantity}주\n"
@@ -1753,8 +1814,8 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                                     f"구제 반등선({RESCUE_REBOUND_TRIGGER_PCT*100:+.1f}%) 도달 + "
                                     f"{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 하회 전량 청산(완성봉 {prev_close_4h:.2f} < {TREND_MA_PERIOD}MA {ma5_4h:.2f})"
                                 )
-                                print(f"{stock_code} {round_number}차 {reason_str} -> 100% 반등 청산!")
-                                sell_orders.append((index, quantity, current_price * 0.98, reason_str, buy_price, buy_date, round_number, "RESCUE_REBOUND"))
+                                print(f"{stock_code} {round_number}차 {dummy_tag}{reason_str} -> 100% 반등 청산!")
+                                sell_orders.append((index, quantity, current_price * 0.98, reason_str, buy_price, buy_date, round_number, "RESCUE_REBOUND", is_dummy))
                             else:
                                 init_pres = be_price if current_price >= be_price else rebound_price
                                 updated_info = update_round_stage(
@@ -1769,29 +1830,36 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                                     rescue_mode=True,
                                     deep_loss_seen=True,
                                     rescue_stage2=True,
+                                    is_dummy=is_dummy,
                                 )
                                 rounds_dict[r_key] = updated_info
                                 cur_loss_pct = ((current_price / buy_price) - 1.0) * 100.0 if buy_price > 0 else 0.0
                                 pres_pct = ((init_pres / buy_price) - 1.0) * 100.0 if buy_price > 0 else 0.0
-                                print(f"{stock_code} {round_number}차 구제 반등선({rebound_price:.2f}) 회복 -> 100% 구제 2단계 승격(보존선 {init_pres:.2f})")
+                                print(f"{stock_code} {round_number}차 {dummy_tag}구제 반등선({rebound_price:.2f}) 회복 -> 100% 구제 2단계 승격(보존선 {init_pres:.2f})")
+                                header_txt = (
+                                    f"👻🛟 [더미 구제 반등 추세추종 승격] {stock_code} {round_number}차(더미) 2단계 진입"
+                                    if is_dummy
+                                    else f"🛟 [구제 반등 추세추종 승격] {stock_code} {round_number}차 2단계 진입"
+                                )
+                                dummy_foot = "\n👻 실제 주문·실제 자금 미반영(가상 추세추종 감시)" if is_dummy else ""
                                 msg = (
-                                    f"🛟 [구제 반등 추세추종 승격] {stock_code} {round_number}차 2단계 진입\n"
+                                    f"{header_txt}\n"
                                     f"🔹 반등 조건: {RESCUE_REBOUND_TRIGGER_PCT*100:+.1f}% 선({rebound_price:.2f}) 회복 & {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 상승 유지\n"
                                     f"📉 매수가: {buy_price:.2f} | 💲 현재가: {current_price:.2f} ({cur_loss_pct:+.2f}%)\n"
                                     f"🛡️ 초기 최저보존선: {init_pres:.2f} ({pres_pct:+.1f}%)\n"
                                     f"📊 잔여 물량(100%): {quantity}주 → 5분 간격 추세추종 감시 시작\n"
-                                    f"💡 본전(+{STEPDOWN_BREAKEVEN_PCT*100:.1f}%, {be_price:.2f}) 돌파 시 보존선이 본전선으로 자동 상향 잠금됩니다."
+                                    f"💡 본전(+{STEPDOWN_BREAKEVEN_PCT*100:.1f}%, {be_price:.2f}) 돌파 시 보존선이 본전선으로 자동 상향 잠금됩니다.{dummy_foot}"
                                 )
                                 telegram_alert.SendMessage(msg)
                         else:
-                            print(f"{stock_code} {round_number}차 구제 대기 중(보유 {held_days}일): 현재가 {current_price:.2f} < 반등선 {rebound_price:.2f} (트랙 B 적립금 상계 대기)")
+                            print(f"{stock_code} {round_number}차 {dummy_tag}구제 대기 중(보유 {held_days}일): 현재가 {current_price:.2f} < 반등선 {rebound_price:.2f}")
                     else:
                         if current_price >= be_price:
                             reason_str = f"구제 본전탈출선(+{STEPDOWN_BREAKEVEN_PCT*100:.1f}%) 도달(얕은 손실 보유 {held_days}일)"
-                            print(f"{stock_code} {round_number}차 {reason_str} -> 100% 자력 탈출!")
-                            sell_orders.append((index, quantity, current_price * 0.98, reason_str, buy_price, buy_date, round_number, "NORMAL"))
+                            print(f"{stock_code} {round_number}차 {dummy_tag}{reason_str} -> 100% 자력 탈출!")
+                            sell_orders.append((index, quantity, current_price * 0.98, reason_str, buy_price, buy_date, round_number, "NORMAL", is_dummy))
                         else:
-                            print(f"{stock_code} {round_number}차 구제 얕은손실 대기(보유 {held_days}일): 현재가 {current_price:.2f} < 본전선 {be_price:.2f}")
+                            print(f"{stock_code} {round_number}차 {dummy_tag}구제 얕은손실 대기(보유 {held_days}일): 현재가 {current_price:.2f} < 본전선 {be_price:.2f}")
                     continue
 
                 # [구간 1·2] 0 ~ 40일 동적 목표가 평가
@@ -1800,8 +1868,8 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     # [구간 2] 26 ~ 40일 본전 탈출 구간: 2단계/분할 없이 100% 즉시 탈출
                     if not allow_stage2:
                         reason_str = f"본전 탈출 구간 목표 도달(보유 {held_days}일, +{target_pct*100:.1f}%)"
-                        print(f"{stock_code} {round_number}차 {reason_str} -> 100% 전량 즉시 탈출!")
-                        sell_orders.append((index, quantity, current_price * 0.98, reason_str, buy_price, buy_date, round_number, "NORMAL"))
+                        print(f"{stock_code} {round_number}차 {dummy_tag}{reason_str} -> 100% 전량 즉시 탈출!")
+                        sell_orders.append((index, quantity, current_price * 0.98, reason_str, buy_price, buy_date, round_number, "NORMAL", is_dummy))
                         continue
 
                     # [구간 1] 0 ~ 25일 정상 수익 추구 구간 (+2.5%)
@@ -1815,7 +1883,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                             if is_ma5_broken
                             else f"1차 목표가 도달 ({part1_pct_str} 전량 익절 설정)"
                         )
-                        print(f"{stock_code} {round_number}차 {reason_str} -> 100% 전량 즉시 익절!")
+                        print(f"{stock_code} {round_number}차 {dummy_tag}{reason_str} -> 100% 전량 즉시 익절!")
                         sell_orders.append((
                             index,
                             quantity,
@@ -1825,6 +1893,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                             buy_date,
                             round_number,
                             "NORMAL",
+                            is_dummy,
                         ))
                         continue
 
@@ -1835,23 +1904,28 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                         else (0.0, float(quantity), False)
                     )
                     if can_split:
-                        p_order, p_order_price = place_close_long(exchange, symbol, part1_qty)
-                        print(f"[1단계 {part1_pct_str} 분할매도 주문 ({round_number}차)]", p_order)
+                        if is_dummy:
+                            real_part1_price = float(current_price)
+                            real_part1_qty = float(part1_qty)
+                        else:
+                            p_order, p_order_price = place_close_long(exchange, symbol, part1_qty)
+                            print(f"[1단계 {part1_pct_str} 분할매도 주문 ({round_number}차)]", p_order)
 
-                        fallback_part1 = float(p_order_price) if p_order_price is not None else float(current_price)
-                        p_order_id = p_order.get("id") if isinstance(p_order, dict) else None
-                        if p_order_id:
-                            p_filled_ok, _ = wait_order_filled(exchange, p_order_id, symbol)
-                            if not p_filled_ok and USE_LIMIT_ORDER:
-                                cancel_order_safe(exchange, p_order_id, symbol)
-                                telegram_alert.SendMessage(
-                                    f"⚠️ 떨사오팔(Bitget) {stock_code} {round_number}차 1단계 {part1_pct_str} 분할매도 지정가 미체결 → 취소"
-                                )
-                                continue
+                            fallback_part1 = float(p_order_price) if p_order_price is not None else float(current_price)
+                            p_order_id = p_order.get("id") if isinstance(p_order, dict) else None
+                            if p_order_id:
+                                p_filled_ok, _ = wait_order_filled(exchange, p_order_id, symbol)
+                                if not p_filled_ok and USE_LIMIT_ORDER:
+                                    cancel_order_safe(exchange, p_order_id, symbol)
+                                    telegram_alert.SendMessage(
+                                        f"⚠️ 떨사오팔(Bitget) {stock_code} {round_number}차 1단계 {part1_pct_str} 분할매도 지정가 미체결 → 취소"
+                                    )
+                                    continue
 
-                        real_part1_price, real_part1_qty, _ = 체결가_조회(
-                            exchange, symbol, p_order, fallback_part1, part1_qty
-                        )
+                            real_part1_price, real_part1_qty, _ = 체결가_조회(
+                                exchange, symbol, p_order, fallback_part1, part1_qty
+                            )
+
                         rem_qty = float(exchange.amount_to_precision(symbol, max(0.0, float(quantity) - float(real_part1_qty))))
                         now_kst_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1862,8 +1936,8 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
                         part1_saved_ratio = 0.0
                         part1_saved_usdt = 0.0
-                        part1_pool_note = ""
-                        if ENABLE_OFFSET_RESCUE and part1_pnl > 0 and _has_rescue_waiting(rounds_dict, exclude_rounds={round_number}):
+                        part1_pool_note = "\n👻 실제 주문 없음 (더미 가상 분할익절 / 실제 자금 미반영)" if is_dummy else ""
+                        if (not is_dummy) and ENABLE_OFFSET_RESCUE and part1_pnl > 0 and _has_rescue_waiting(rounds_dict, exclude_rounds={round_number}):
                             part1_saved_ratio = max(0.0, min(1.0, float(OFFSET_PROFIT_SAVE_RATIO)))
                             part1_saved_usdt = part1_pnl * part1_saved_ratio
                             if part1_saved_usdt > 0:
@@ -1884,16 +1958,22 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                             part1_sold_pct=part1_pct_val,
                             part1_sold_at=now_kst_str,
                             part1_pool_saved_ratio=part1_saved_ratio,
+                            is_dummy=is_dummy,
                         )
                         rounds_dict[r_key] = updated_info
                         partial_sell_events.append((round_number, real_part1_qty, real_part1_price, rem_qty))
 
                         print(
-                            f"{stock_code} {round_number}차 1차 목표가 돌파 -> {part1_pct_str}({real_part1_qty}주 @ {real_part1_price:.4f}) 분할익절 완료 & 잔여 {rem_pct_str}({rem_qty}주) 2단계(추세추종) 승격!"
+                            f"{stock_code} {round_number}차 {dummy_tag}1차 목표가 돌파 -> {part1_pct_str}({real_part1_qty}주 @ {real_part1_price:.4f}) {'가상 ' if is_dummy else ''}분할익절 완료 & 잔여 {rem_pct_str}({rem_qty}주) 2단계(추세추종) 승격!"
+                        )
+                        p1_header = (
+                            f"👻🎯 [더미 1차 목표가 돌파 & {part1_pct_str} 가상 분할익절] {stock_code} {round_number}차(더미) 2단계 승격"
+                            if is_dummy
+                            else f"🎯 [1차 목표가 돌파 & {part1_pct_str} 분할익절] {stock_code} {round_number}차 2단계 승격"
                         )
                         msg = (
-                            f"🎯 [1차 목표가 돌파 & {part1_pct_str} 분할익절] {stock_code} {round_number}차 2단계 승격\n"
-                            f"🔹 1차 익절({part1_pct_str}): {real_part1_qty}주 체결 (체결가 {real_part1_price:.4f} / 수익률 {part1_profit_pct:+.2f}%)\n"
+                            f"{p1_header}\n"
+                            f"🔹 1차 {'가상 ' if is_dummy else ''}익절({part1_pct_str}): {real_part1_qty}주 체결 (체결가 {real_part1_price:.4f} / 수익률 {part1_profit_pct:+.2f}%)\n"
                             f"🔹 잔여 물량({rem_pct_str}): {rem_qty}주 → [2단계 추세 추종 모드 진입]\n"
                             f"📉 매수가: {buy_price:.2f} | 📈 1차 목표가: {target_price:.2f} (+{SELL_PROFIT_PCT*100:.1f}%)\n"
                             f"💲 현재가: {current_price:.2f} | 📊 {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA: {ma5_4h:.2f}\n"
@@ -1906,14 +1986,19 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                         sheet_logger.log_trade(
                             action="SELL",
                             symbol=symbol,
-                            level=f"{round_number}차(1/2)",
+                            level=f"더미 {round_number}차(1/2)" if is_dummy else f"{round_number}차(1/2)",
                             price=real_part1_price,
                             amount=real_part1_qty,
                             fee=part1_fee,
                             pnl=part1_pnl,
                             pnl_pct=part1_profit_pct,
+                            is_dummy=is_dummy,
                             close_all=False,
-                            note=f"1단계 목표가 돌파 {part1_pct_str} 분할익절 (잔여 {rem_qty}주 2단계 승격, 보존선 {target_price:.2f})",
+                            note=(
+                                f"[더미 가상분할익절] 1단계 목표가 돌파 {part1_pct_str} (잔여 {rem_qty}주 2단계 승격, 보존선 {target_price:.2f})"
+                                if is_dummy
+                                else f"1단계 목표가 돌파 {part1_pct_str} 분할익절 (잔여 {rem_qty}주 2단계 승격, 보존선 {target_price:.2f})"
+                            ),
                         )
                     else:
                         updated_info = update_round_stage(
@@ -1925,12 +2010,18 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                             buy_price=buy_price,
                             quantity=quantity,
                             initial_quantity=initial_quantity,
+                            is_dummy=is_dummy,
                         )
                         rounds_dict[r_key] = updated_info
                         skip_note = "(분할익절 0% 설정)" if part1_ratio <= 0.0 else "(최소주문금액 제약으로 분할 생략)"
-                        print(f"{stock_code} {round_number}차 1차 목표가 돌파 {skip_note} -> 전량 2단계(추세추종) 승격!")
+                        print(f"{stock_code} {round_number}차 {dummy_tag}1차 목표가 돌파 {skip_note} -> 전량 2단계(추세추종) 승격!")
+                        s2_header = (
+                            f"👻🎯 [더미 1차 목표가 돌파] {stock_code} {round_number}차(더미) 2단계 승격"
+                            if is_dummy
+                            else f"🎯 [1차 목표가 돌파] {stock_code} {round_number}차 2단계 승격"
+                        )
                         msg = (
-                            f"🎯 [1차 목표가 돌파] {stock_code} {round_number}차 2단계 승격\n"
+                            f"{s2_header}\n"
                             f"🔹 진입 단계: [2단계 추세 추종 모드 {skip_note}]\n"
                             f"📈 1차 목표가: {target_price:.2f} (수익률 +{SELL_PROFIT_PCT*100:.1f}%)\n"
                             f"💲 현재가: {current_price:.2f}\n"
@@ -1939,9 +2030,9 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                         )
                         telegram_alert.SendMessage(msg)
                 else:
-                    print(f"{stock_code} {round_number}차 1단계 일일 점검({phase_label}, 보유 {held_days}일): 현재가 {current_price:.2f} < 목표가 {dynamic_target_price:.2f}")
+                    print(f"{stock_code} {round_number}차 {dummy_tag}1단계 일일 점검({phase_label}, 보유 {held_days}일): 현재가 {current_price:.2f} < 목표가 {dynamic_target_price:.2f}")
             else:
-                print(f"{stock_code} {round_number}차 1단계 대기 중 (일일 점검 시점에만 목표/승격 확인)")
+                print(f"{stock_code} {round_number}차 {dummy_tag}1단계 대기 중 (일일 점검 시점에만 목표/승격 확인)")
 
         # 3) 2단계: 추세추종 (기존 수익 추세추종 + 구제 반등 추세추종 + 본전 래칫 상향)
         elif current_stage == 2:
@@ -1956,10 +2047,16 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                         preservation_line=preservation_line,
                         target_price=preservation_line,
                         rescue_stage2=True,
+                        is_dummy=is_dummy,
                     )
-                    print(f"{stock_code} {round_number}차 구제 추세추종 본전선({be_line:.2f}) 돌파 -> 보존선 상향 잠금!")
+                    print(f"{stock_code} {round_number}차 {dummy_tag}구제 추세추종 본전선({be_line:.2f}) 돌파 -> 보존선 상향 잠금!")
+                    r_lock_header = (
+                        f"👻🛡️ [더미 구제 추세추종 본전 잠금] {stock_code} {round_number}차(더미)"
+                        if is_dummy
+                        else f"🛡️ [구제 추세추종 본전 잠금] {stock_code} {round_number}차"
+                    )
                     telegram_alert.SendMessage(
-                        f"🛡️ [구제 추세추종 본전 잠금] {stock_code} {round_number}차\n"
+                        f"{r_lock_header}\n"
                         f"🔹 현재가 {current_price:.2f}가 본전선(+{STEPDOWN_BREAKEVEN_PCT*100:.1f}%, {be_line:.2f})을 돌파했습니다.\n"
                         f"🔒 최저보존선을 {be_line:.2f}로 자동 상향하여 손실 재진입을 차단합니다."
                     )
@@ -1970,15 +2067,15 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
             # 시나리오 ②: 보존선 방어 매도 (현재가 <= 보존선 * 0.998)
             if current_price <= preservation_line * PRESERVATION_LINE_MULTIPLIER:
-                print(f"{stock_code} {round_number}차 {pres_label} 조건 충족: 현재가 {current_price:.2f} <= {preservation_line * PRESERVATION_LINE_MULTIPLIER:.2f}")
-                sell_orders.append((index, quantity, current_price * 0.98, f"{pres_label}(보존선 {preservation_line:.2f} × {PRESERVATION_LINE_MULTIPLIER} 대비 하향 터치)", buy_price, buy_date, round_number, order_tag))
+                print(f"{stock_code} {round_number}차 {dummy_tag}{pres_label} 조건 충족: 현재가 {current_price:.2f} <= {preservation_line * PRESERVATION_LINE_MULTIPLIER:.2f}")
+                sell_orders.append((index, quantity, current_price * 0.98, f"{pres_label}(보존선 {preservation_line:.2f} × {PRESERVATION_LINE_MULTIPLIER} 대비 하향 터치)", buy_price, buy_date, round_number, order_tag, is_dummy))
             # 시나리오 ①: 추세 꺾임 익절 (TREND_TIMEFRAME TREND_MA_PERIOD MA 버퍼 기준 이탈)
             elif is_ma5_broken:
                 _buf_p = float(TREND_MA_BUFFER_PCT)
                 _buf_r = (_buf_p / 100.0) if _buf_p >= 0.05 else max(0.0, _buf_p)
                 _ma_cut = ma5_4h * (1.0 - _buf_r)
                 print(
-                    f"{stock_code} {round_number}차 {ma_label} 조건 충족: "
+                    f"{stock_code} {round_number}차 {dummy_tag}{ma_label} 조건 충족: "
                     f"{TREND_TIMEFRAME}봉 종가 {prev_close_4h:.2f} < {TREND_MA_PERIOD}MA 버퍼기준 {_ma_cut:.2f} (원본MA {ma5_4h:.2f})"
                 )
                 sell_orders.append((
@@ -1990,38 +2087,45 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     buy_date,
                     round_number,
                     order_tag,
+                    is_dummy,
                 ))
             else:
-                print(f"{stock_code} {round_number}차 2단계 홀딩 중 (잔여 {quantity}주 | 현재가 {current_price:.2f} > 보존선 {preservation_line:.2f}, {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 상승 추세 유지)")
+                print(f"{stock_code} {round_number}차 {dummy_tag}2단계 홀딩 중 (잔여 {quantity}주 | 현재가 {current_price:.2f} > 보존선 {preservation_line:.2f}, {TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 상승 추세 유지)")
 
-    closed_round_nums = {r_n for (_, _, _, _, _, _, r_n, _) in sell_orders}
+    closed_round_nums = {r_n for (_, _, _, _, _, _, r_n, _, _) in sell_orders}
     has_other_rescue_waiting = _has_rescue_waiting(rounds_dict, exclude_rounds=closed_round_nums)
 
-    for index, quantity, sell_price, sell_reason, buy_price, buy_date, round_number, order_tag in sell_orders:
+    for index, quantity, sell_price, sell_reason, buy_price, buy_date, round_number, order_tag, is_dummy in sell_orders:
         r_key = str(round_number)
         r_info_before = rounds_dict.get(r_key, {})
         part1_qty_done = float(r_info_before.get("part1_sold_qty", 0.0) or 0.0)
         part1_price_done = r_info_before.get("part1_sold_price", None)
         part1_pct_done = r_info_before.get("part1_sold_pct", None)
-        part1_saved_ratio = float(r_info_before.get("part1_pool_saved_ratio", 0.0) or 0.0)
-        offset_qty_done = float(r_info_before.get("offset_sold_qty", 0.0) or 0.0)
-        offset_proceeds_done = float(r_info_before.get("offset_sold_proceeds", 0.0) or 0.0)
+        part1_saved_ratio = 0.0 if is_dummy else float(r_info_before.get("part1_pool_saved_ratio", 0.0) or 0.0)
+        offset_qty_done = 0.0 if is_dummy else float(r_info_before.get("offset_sold_qty", 0.0) or 0.0)
+        offset_proceeds_done = 0.0 if is_dummy else float(r_info_before.get("offset_sold_proceeds", 0.0) or 0.0)
 
-        # ✅ 주문은 Bitget 선물 (청산), 엑셀엔 실체결값 저장
-        order, order_price = place_close_long(exchange, symbol, quantity)
-        print("[매도주문]", order)
+        if is_dummy:
+            # 더미 차수는 실제 Bitget 주문을 내지 않고 현재 선물가 기준으로 가상 청산
+            real_sell_price = float(current_price)
+            real_sell_qty = float(quantity)
+            print(f"[더미 매도 가상체결 ({round_number}차)] 가격={real_sell_price:.4f}, 수량={real_sell_qty}")
+        else:
+            # ✅ 주문은 Bitget 선물 (청산), 엑셀엔 실체결값 저장
+            order, order_price = place_close_long(exchange, symbol, quantity)
+            print("[매도주문]", order)
 
-        fallback_sell = float(order_price) if order_price is not None else float(current_price)
-        order_id = order.get("id") if isinstance(order, dict) else None
-        if order_id:
-            filled_ok, _ = wait_order_filled(exchange, order_id, symbol)
-            if not filled_ok and USE_LIMIT_ORDER:
-                cancel_order_safe(exchange, order_id, symbol)
-                telegram_alert.SendMessage(f"⚠️ 떨사오팔(Bitget) {stock_code} 매도 지정가 미체결 → 취소 ({df.at[index,'차수']}차)")
-                continue
+            fallback_sell = float(order_price) if order_price is not None else float(current_price)
+            order_id = order.get("id") if isinstance(order, dict) else None
+            if order_id:
+                filled_ok, _ = wait_order_filled(exchange, order_id, symbol)
+                if not filled_ok and USE_LIMIT_ORDER:
+                    cancel_order_safe(exchange, order_id, symbol)
+                    telegram_alert.SendMessage(f"⚠️ 떨사오팔(Bitget) {stock_code} 매도 지정가 미체결 → 취소 ({df.at[index,'차수']}차)")
+                    continue
 
-        # ★ 비트겟 실제 체결가/수량
-        real_sell_price, real_sell_qty, _ = 체결가_조회(exchange, symbol, order, fallback_sell, quantity)
+            # ★ 비트겟 실제 체결가/수량
+            real_sell_price, real_sell_qty, _ = 체결가_조회(exchange, symbol, order, fallback_sell, quantity)
         quantity = real_sell_qty
 
         try:
@@ -2031,7 +2135,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
         # 1차 분할익절 / 이전 부분 구제상계 / 금회 최종 매도를 합산하여 가중평균 매도가 산출
         has_part1 = (part1_qty_done > 0 and part1_price_done is not None and float(part1_price_done) > 0)
-        has_offset = (offset_qty_done > 0 and offset_proceeds_done > 0)
+        has_offset = (not is_dummy) and (offset_qty_done > 0 and offset_proceeds_done > 0)
         p1_proceeds = (float(part1_price_done) * float(part1_qty_done)) if has_part1 else 0.0
         off_proceeds = float(offset_proceeds_done) if has_offset else 0.0
         this_proceeds = float(real_sell_price) * float(real_sell_qty)
@@ -2051,44 +2155,57 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         else:
             profit_pct = ((net_sell / buy_price_f) - 1.0) * 100.0
 
-        # 구제 적립금 적립 / 손실 보전 및 복리 조정률 왜곡 방지
-        this_net_sell = float(real_sell_price) * (1.0 - SELL_FEE_RATE)
-        this_fill_pnl = (this_net_sell - buy_price_f) * float(real_sell_qty) if buy_price_f > 0 else 0.0
-        part1_pnl_done = ((float(part1_price_done) * (1.0 - SELL_FEE_RATE) - buy_price_f) * float(part1_qty_done)) if (has_part1 and buy_price_f > 0) else 0.0
-
-        this_saved_usdt = 0.0
-        this_covered_usdt = 0.0
         pool_msg_suffix = ""
-        if ENABLE_OFFSET_RESCUE:
-            if this_fill_pnl > 0 and has_other_rescue_waiting:
-                save_ratio = max(0.0, min(1.0, float(OFFSET_PROFIT_SAVE_RATIO)))
-                this_saved_usdt = this_fill_pnl * save_ratio
-                if this_saved_usdt > 0:
-                    new_pool = add_offset_pool(stock_code, this_saved_usdt)
-                    pool_msg_suffix = f"\n🏦 구제 적립금 적립: +${this_saved_usdt:.2f} USDT (누적 ${new_pool:.2f} USDT)"
-            elif this_fill_pnl < 0 and order_tag in ("RESCUE_REBOUND", "RESCUE_STAGE2"):
-                this_covered_usdt, remain_pool = consume_offset_pool(stock_code, abs(this_fill_pnl))
-                if this_covered_usdt > 0:
-                    pool_msg_suffix = f"\n🏦 구제 적립금 보전: ${this_covered_usdt:.2f} USDT 차감 (잔여 ${remain_pool:.2f} USDT)"
+        if is_dummy:
+            # 더미 차수는 실제 투자금·손익차트·구제적립금에서 완전 격리
+            weight = HIGH_DROP_ADJ_WEIGHT if bool(df.at[index, "고점대비하락조건"]) else 1.0
+            adj_pct = 0.0
+            next_invest_money = current_invest_money
+            df.at[index, "수수료율(매도)"] = 0.06
+            df.at[index, "순매도가(수수료반영)"] = net_sell
+            df.at[index, "수익률(%)"] = profit_pct
+            df.at[index, "조정률(수익률/7)(%)"] = 0.0
+            df.at[index, "다음투자금"] = next_invest_money
+            df.at[index, "더미여부"] = True
+            pool_msg_suffix = "\n👻 실제 주문 없음 (더미 가상청산 / 투자금·손익차트·구제적립금 미반영)"
+        else:
+            # 구제 적립금 적립 / 손실 보전 및 복리 조정률 왜곡 방지
+            this_net_sell = float(real_sell_price) * (1.0 - SELL_FEE_RATE)
+            this_fill_pnl = (this_net_sell - buy_price_f) * float(real_sell_qty) if buy_price_f > 0 else 0.0
+            part1_pnl_done = ((float(part1_price_done) * (1.0 - SELL_FEE_RATE) - buy_price_f) * float(part1_qty_done)) if (has_part1 and buy_price_f > 0) else 0.0
 
-        part1_unoffset_pnl = part1_pnl_done * (1.0 - part1_saved_ratio)
-        this_unoffset_pnl = this_fill_pnl - this_saved_usdt + this_covered_usdt
-        total_cost_basis = buy_price_f * total_sold_qty if (buy_price_f > 0 and total_sold_qty > 0) else 0.0
-        effective_profit_pct = ((part1_unoffset_pnl + this_unoffset_pnl) / total_cost_basis) * 100.0 if total_cost_basis > 0 else 0.0
+            this_saved_usdt = 0.0
+            this_covered_usdt = 0.0
+            if ENABLE_OFFSET_RESCUE:
+                if this_fill_pnl > 0 and has_other_rescue_waiting:
+                    save_ratio = max(0.0, min(1.0, float(OFFSET_PROFIT_SAVE_RATIO)))
+                    this_saved_usdt = this_fill_pnl * save_ratio
+                    if this_saved_usdt > 0:
+                        new_pool = add_offset_pool(stock_code, this_saved_usdt)
+                        pool_msg_suffix = f"\n🏦 구제 적립금 적립: +${this_saved_usdt:.2f} USDT (누적 ${new_pool:.2f} USDT)"
+                elif this_fill_pnl < 0 and order_tag in ("RESCUE_REBOUND", "RESCUE_STAGE2"):
+                    this_covered_usdt, remain_pool = consume_offset_pool(stock_code, abs(this_fill_pnl))
+                    if this_covered_usdt > 0:
+                        pool_msg_suffix = f"\n🏦 구제 적립금 보전: ${this_covered_usdt:.2f} USDT 차감 (잔여 ${remain_pool:.2f} USDT)"
 
-        weight = HIGH_DROP_ADJ_WEIGHT if bool(df.at[index, "고점대비하락조건"]) else 1.0
-        adj_pct = (effective_profit_pct / ADJ_DIVISOR) * weight
+            part1_unoffset_pnl = part1_pnl_done * (1.0 - part1_saved_ratio)
+            this_unoffset_pnl = this_fill_pnl - this_saved_usdt + this_covered_usdt
+            total_cost_basis = buy_price_f * total_sold_qty if (buy_price_f > 0 and total_sold_qty > 0) else 0.0
+            effective_profit_pct = ((part1_unoffset_pnl + this_unoffset_pnl) / total_cost_basis) * 100.0 if total_cost_basis > 0 else 0.0
 
-        next_invest_money = int(round(current_invest_money * (1.0 + (adj_pct / 100.0))))
+            weight = HIGH_DROP_ADJ_WEIGHT if bool(df.at[index, "고점대비하락조건"]) else 1.0
+            adj_pct = (effective_profit_pct / ADJ_DIVISOR) * weight
 
-        df.at[index, "수수료율(매도)"] = 0.06
-        df.at[index, "순매도가(수수료반영)"] = net_sell
-        df.at[index, "수익률(%)"] = profit_pct
-        df.at[index, "조정률(수익률/7)(%)"] = adj_pct
-        df.at[index, "다음투자금"] = next_invest_money
+            next_invest_money = int(round(current_invest_money * (1.0 + (adj_pct / 100.0))))
 
-        투자금시트_업데이트(stock_code, next_invest_money, effective_profit_pct, adj_pct)
-        current_invest_money = next_invest_money
+            df.at[index, "수수료율(매도)"] = 0.06
+            df.at[index, "순매도가(수수료반영)"] = net_sell
+            df.at[index, "수익률(%)"] = profit_pct
+            df.at[index, "조정률(수익률/7)(%)"] = adj_pct
+            df.at[index, "다음투자금"] = next_invest_money
+
+            투자금시트_업데이트(stock_code, next_invest_money, effective_profit_pct, adj_pct)
+            current_invest_money = next_invest_money
 
         # 상태 파일에서 해당 차수 제거
         remove_round_from_state(stock_code, round_number)
@@ -2097,6 +2214,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         if highest_price_30d and highest_price_30d > 0:
             drop_rate = (highest_price_30d - current_price) / highest_price_30d * 100.0
 
+        round_disp = f"{df.at[index, '차수']}차(더미)" if is_dummy else f"{df.at[index, '차수']}차"
         if has_part1:
             _, default_p1_str, default_rem_str, default_p1_val = get_stage1_partial_sell_config()
             p1_val = float(part1_pct_done) if part1_pct_done is not None else default_p1_val
@@ -2106,18 +2224,22 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
 
             part2_net_sell = float(real_sell_price) * (1.0 - SELL_FEE_RATE)
             part2_profit_pct = ((part2_net_sell / buy_price_f) - 1.0) * 100.0 if buy_price_f > 0 else 0.0
+            adj_line = (
+                f"💵 실제 투자금(유지): {next_invest_money}\n"
+                if is_dummy
+                else f"✅ 조정률(유효수익률/{int(ADJ_DIVISOR)}×가중치 {weight}): {adj_pct:.2f}%\n💰 다음 투자금(종목별, 정수): {next_invest_money}\n"
+            )
             msg = (
-                f"📌 떨사오팔 일반전략 {stock_code} {df.at[index, '차수']}차 2단계 잔여({r2_label}) 최종 매도 완료\n"
+                f"{'👻📌 [더미] ' if is_dummy else '📌 '}떨사오팔 일반전략 {stock_code} {round_disp} 2단계 잔여({r2_label}) 최종 {'가상 ' if is_dummy else ''}매도 완료\n"
                 f"🔹 매도 사유: {sell_reason}\n"
                 f"📉 매수가(기록): {buy_price_f:.2f}\n"
-                f"📈 1차({p1_label}) 기익절: {part1_qty_done}주 @ {float(part1_price_done):.4f}\n"
-                f"📈 2차({r2_label}) 금회체결: {quantity}주 @ {float(real_sell_price):.4f} ({part2_profit_pct:+.2f}%)\n"
+                f"📈 1차({p1_label}) 기{'가상' if is_dummy else ''}익절: {part1_qty_done}주 @ {float(part1_price_done):.4f}\n"
+                f"📈 2차({r2_label}) 금회{'가상' if is_dummy else ''}체결: {quantity}주 @ {float(real_sell_price):.4f} ({part2_profit_pct:+.2f}%)\n"
                 f"📊 합산 평균매도가: {sell_price_f:.4f} (총 {total_sold_qty}주 완판)\n"
                 f"📅 매수일: {buy_date} | 📅 매도완결일: {datetime.now(KST).strftime('%Y-%m-%d')}\n"
                 f"💸 매도수수료: 0.06% (매도만)\n"
                 f"✅ 최종 합산 수익률(수수료반영): {profit_pct:.2f}%\n"
-                f"✅ 조정률(유효수익률/{int(ADJ_DIVISOR)}×가중치 {weight}): {adj_pct:.2f}%\n"
-                f"💰 다음 투자금(종목별, 정수): {next_invest_money}\n"
+                f"{adj_line}"
                 f"📊 고점 대비 낙폭률(현재가 기준): {drop_rate:.2f}%"
                 f"{pool_msg_suffix}"
             )
@@ -2127,18 +2249,22 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                 if has_offset
                 else ""
             )
+            adj_line = (
+                f"💵 실제 투자금(유지): {next_invest_money}\n"
+                if is_dummy
+                else f"✅ 조정률(유효수익률/{int(ADJ_DIVISOR)}×가중치 {weight}): {adj_pct:.2f}%\n💰 다음 투자금(종목별, 정수): {next_invest_money}\n"
+            )
             msg = (
-                f"📌 떨사오팔 일반전략 {stock_code} {df.at[index, '차수']}차 매도 발생\n"
+                f"{'👻📌 [더미] ' if is_dummy else '📌 '}떨사오팔 일반전략 {stock_code} {round_disp} {'가상 ' if is_dummy else ''}매도 발생\n"
                 f"🔹 매도 사유: {sell_reason}\n"
                 f"📉 매수가(기록): {buy_price_f:.2f}\n"
-                f"📈 매도가(Bitget 체결): {sell_price_f:.4f}\n"
+                f"📈 매도가({'가상' if is_dummy else 'Bitget 체결'}): {sell_price_f:.4f}\n"
                 f"📊 매도 수량: {quantity}주{offset_hist_line}\n"
                 f"📅 매수일: {buy_date}\n"
                 f"📅 매도일: {datetime.now(KST).strftime('%Y-%m-%d')}\n"
                 f"💸 매도수수료: 0.06% (매도만)\n"
                 f"✅ 수익률(수수료반영): {profit_pct:.2f}%\n"
-                f"✅ 조정률(유효수익률/{int(ADJ_DIVISOR)}×가중치 {weight}): {adj_pct:.2f}%\n"
-                f"💰 다음 투자금(종목별, 정수): {next_invest_money}\n"
+                f"{adj_line}"
                 f"📊 고점 대비 낙폭률(현재가 기준): {drop_rate:.2f}%"
                 f"{pool_msg_suffix}"
             )
@@ -2149,17 +2275,28 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         real_pnl = (part2_net - buy_price_f) * float(quantity)  # 금회 체결분 실현 손익 (USDT)
         fee_usdt = float(real_sell_price) * float(quantity) * SELL_FEE_RATE  # 금회 체결분 매도 수수료 (USDT)
         part2_pct = ((part2_net / buy_price_f) - 1.0) * 100.0 if buy_price_f > 0 else 0.0
+        sheet_level = (
+            (f"더미 {df.at[index, '차수']}차(2/2)" if has_part1 else f"더미 {df.at[index, '차수']}차")
+            if is_dummy
+            else (f"{df.at[index, '차수']}차(2/2)" if has_part1 else f"{df.at[index, '차수']}차")
+        )
+        sheet_note = (
+            f"[더미 가상청산] {sell_reason} (가상수익률 {profit_pct:+.2f}%, 실제자금 미반영)"
+            if is_dummy
+            else (f"{sell_reason} (합산수익률 {profit_pct:.2f}%, 조정률 {adj_pct:+.2f}%)" if has_part1 else f"{sell_reason} (조정률 {adj_pct:+.2f}%)")
+        )
         sheet_logger.log_trade(
             action="SELL",
             symbol=symbol,
-            level=f"{df.at[index, '차수']}차(2/2)" if has_part1 else f"{df.at[index, '차수']}차",
+            level=sheet_level,
             price=real_sell_price,
             amount=quantity,
             fee=fee_usdt,
             pnl=real_pnl,
             pnl_pct=part2_pct if has_part1 else profit_pct,
+            is_dummy=is_dummy,
             close_all=True,
-            note=f"{sell_reason} (합산수익률 {profit_pct:.2f}%, 조정률 {adj_pct:+.2f}%)" if has_part1 else f"{sell_reason} (조정률 {adj_pct:+.2f}%)"
+            note=sheet_note,
         )
 
     if sell_orders:
@@ -2181,6 +2318,8 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         # 미매도 보유 차수별 매도 기준가 목록 구성
         rounds_detail_lines = []
         has_any_rescue = False
+        real_cnt = 0
+        dummy_cnt = 0
         if not stock_data.empty:
             uncompleted_df = stock_data[pd.isna(stock_data["매도가"])].copy()
             if not uncompleted_df.empty:
@@ -2204,6 +2343,13 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     t_price = b_price * (1.0 + SELL_PROFIT_PCT)
                     r_key = str(r_num)
                     r_state_info = rounds_dict.get(r_key, {})
+                    r_is_dummy = _to_bool_safe(r_row.get("더미여부", False)) or bool(r_state_info.get("is_dummy", False))
+                    if r_is_dummy:
+                        dummy_cnt += 1
+                    else:
+                        real_cnt += 1
+                    r_label = f"{r_num}차[더미]" if r_is_dummy else f"{r_num}차"
+
                     r_stage = int(r_state_info.get("stage", 1))
                     r_pres_line = float(r_state_info.get("preservation_line", t_price))
                     r_part1_qty = float(r_state_info.get("part1_sold_qty", 0.0) or 0.0)
@@ -2211,7 +2357,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     r_rescue_mode = bool(r_state_info.get("rescue_mode", False))
                     r_deep_loss = bool(r_state_info.get("deep_loss_seen", False))
                     r_rescue_stage2 = bool(r_state_info.get("rescue_stage2", False))
-                    r_offset_sold_qty = float(r_state_info.get("offset_sold_qty", 0.0) or 0.0)
+                    r_offset_sold_qty = 0.0 if r_is_dummy else float(r_state_info.get("offset_sold_qty", 0.0) or 0.0)
                     r_rem_qty = float(r_state_info.get("quantity", r_row.get("수량", 0.0)) or 0.0)
 
                     r_max_hold_days = MAX_HOLD_DAYS_HIGH_DROP if bool(r_row.get("고점대비하락조건", False)) else MAX_HOLD_DAYS_NORMAL
@@ -2231,9 +2377,12 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                             force_sell_date = r_buy_date + timedelta(days=r_max_hold_days)
                             force_sell_str = f", 강제매도일 {force_sell_date.strftime('%Y-%m-%d')}"
                         elif r_is_rescue_phase or r_rescue_mode:
-                            has_any_rescue = True
-                            off_str = f", 상계 {r_offset_sold_qty:g}주" if r_offset_sold_qty > 0 else ""
-                            force_sell_str = f", 구제진행중(보유 {r_held_days}일, 잔여 {r_rem_qty:g}주{off_str})"
+                            if r_is_dummy:
+                                force_sell_str = f", 구제(트랙A, 보유 {r_held_days}일)"
+                            else:
+                                has_any_rescue = True
+                                off_str = f", 상계 {r_offset_sold_qty:g}주" if r_offset_sold_qty > 0 else ""
+                                force_sell_str = f", 구제진행중(보유 {r_held_days}일, 잔여 {r_rem_qty:g}주{off_str})"
                         else:
                             rescue_date = r_buy_date + timedelta(days=r_max_hold_days + 1)
                             force_sell_str = f", 구제전환일 {rescue_date.strftime('%Y-%m-%d')}"
@@ -2256,30 +2405,31 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                         _ma_disp = ma5_4h * (1.0 - _br) if ma5_4h > 0 else 0.0
                         ma_str = f"{_ma_disp:.2f}({stage2_tag})" if _ma_disp > 0 else f"{r_pres_line:.2f}({stage2_tag})"
                         rounds_detail_lines.append(
-                            f"  • {r_num}차: {ma_str} (매수가 {b_price:.2f}, 보존선 {r_pres_line:.2f}{force_sell_str})"
+                            f"  • {r_label}: {ma_str} (매수가 {b_price:.2f}, 보존선 {r_pres_line:.2f}{force_sell_str})"
                         )
                     else:
                         if (r_is_rescue_phase or r_rescue_mode) and not ENABLE_HARD_TIMECUT:
                             if r_deep_loss:
                                 reb_price = b_price * (1.0 + RESCUE_REBOUND_TRIGGER_PCT)
                                 rounds_detail_lines.append(
-                                    f"  • {r_num}차: {reb_price:.2f}(🛟구제 반등선 {RESCUE_REBOUND_TRIGGER_PCT*100:+.0f}%) (매수가 {b_price:.2f}{force_sell_str})"
+                                    f"  • {r_label}: {reb_price:.2f}(🛟구제 반등선 {RESCUE_REBOUND_TRIGGER_PCT*100:+.0f}%) (매수가 {b_price:.2f}{force_sell_str})"
                                 )
                             else:
                                 be_price = b_price * (1.0 + STEPDOWN_BREAKEVEN_PCT)
                                 rounds_detail_lines.append(
-                                    f"  • {r_num}차: {be_price:.2f}(🛟구제 본전선 +{STEPDOWN_BREAKEVEN_PCT*100:.1f}%) (매수가 {b_price:.2f}{force_sell_str})"
+                                    f"  • {r_label}: {be_price:.2f}(🛟구제 본전선 +{STEPDOWN_BREAKEVEN_PCT*100:.1f}%) (매수가 {b_price:.2f}{force_sell_str})"
                                 )
                         elif not r_allow_stage2:
                             dyn_t = b_price * (1.0 + r_target_pct)
                             rounds_detail_lines.append(
-                                f"  • {r_num}차: {dyn_t:.2f}(본전구간 +{r_target_pct*100:.1f}%) (매수가 {b_price:.2f}{force_sell_str})"
+                                f"  • {r_label}: {dyn_t:.2f}(본전구간 +{r_target_pct*100:.1f}%) (매수가 {b_price:.2f}{force_sell_str})"
                             )
                         else:
                             rounds_detail_lines.append(
-                                f"  • {r_num}차: {t_price:.2f} (매수가 {b_price:.2f}{force_sell_str})"
+                                f"  • {r_label}: {t_price:.2f} (매수가 {b_price:.2f}{force_sell_str})"
                             )
 
+        remaining_summary = f"{remaining}개 (실매수 {real_cnt}개 / 더미 {dummy_cnt}개)" if dummy_cnt > 0 else f"{remaining}개"
         pool_bal_disp = get_offset_pool(stock_code)
         pool_footer = f"\n🏦 구제 적립금 잔액: ${pool_bal_disp:.2f} USDT" if (pool_bal_disp > 0 or has_any_rescue) else ""
         rounds_detail_str = ("\n🎯 차수별 매도 기준가:\n" + "\n".join(rounds_detail_lines) + pool_footer) if rounds_detail_lines else pool_footer
@@ -2300,7 +2450,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                 f"⏸️ {stock_code} 매도 없음\n"
                 f"🔹 이유: 목표가 미도달 & 구제모드 대기\n"
                 f"📈 현재가(LS): {disp_price:.2f}\n"
-                f"🧾 미매도 보유 차수: {remaining}개"
+                f"🧾 미매도 보유 차수: {remaining_summary}"
                 f"{rounds_detail_str}"
             )
             telegram_alert.SendMessage(msg)
@@ -2316,7 +2466,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                     f"⏸️ {stock_code} 매도 현황 브리핑 (정기)\n"
                     f"🔹 상태: 목표가 미도달 & 2단계 추세 유지 중\n"
                     f"📈 현재가(LS): {current_price:.2f}\n"
-                    f"🧾 미매도 보유 차수: {remaining}개 (2단계 추세추종: {stage2_cnt}개)"
+                    f"🧾 미매도 보유 차수: {remaining_summary} (2단계 추세추종: {stage2_cnt}개)"
                     f"{rounds_detail_str}"
                 )
                 telegram_alert.SendMessage(msg)
@@ -2326,18 +2476,34 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
             print(f"[매도 없음] {stock_code} (목표가 미도달 or 2단계 홀딩 중 / 잔여 {remaining}개)")
 
     매매기록저장(df)
+    _sync_bot_state_to_sheet(exchange, symbol, stock_code, ma_status=(is_ma5_broken, prev_close_4h, ma5_4h))
+    return bool(sell_orders or partial_sell_events or offset_events)
+
+
+# =========================
+# ✅ 봇 상태 동기화 & 매수 기록
+# =========================
+def _sync_bot_state_to_sheet(exchange, symbol, stock_code, ma_status=None):
     try:
         latest_state = load_round_state()
         latest_stock_state = latest_state.get(stock_code, {})
         latest_rounds = latest_stock_state.get("rounds", {})
         has_stage2_now = any(r.get("stage") == 2 for r in latest_rounds.values())
-        rescue_cnt = sum(1 for r in latest_rounds.values() if r.get("rescue_mode"))
+        rescue_cnt = sum(1 for r in latest_rounds.values() if r.get("rescue_mode") and not r.get("is_dummy"))
+        real_rounds_cnt = sum(1 for r in latest_rounds.values() if not r.get("is_dummy"))
+        dummy_rounds_cnt = sum(1 for r in latest_rounds.values() if r.get("is_dummy"))
+        if ma_status is None:
+            is_ma5_broken, prev_close_4h, ma5_4h = get_trend_ma_status(exchange, symbol)
+        else:
+            is_ma5_broken, prev_close_4h, ma5_4h = ma_status
         sheet_logger.log_bot_state({
             "symbol": symbol,
             "stock_code": stock_code,
             "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             "offset_pool_usdt": round(_safe_nonneg_float(latest_stock_state.get("offset_pool_usdt", 0.0), 0.0), 4),
             "rescue_rounds_cnt": int(rescue_cnt),
+            "real_rounds_cnt": int(real_rounds_cnt),
+            "dummy_rounds_cnt": int(dummy_rounds_cnt),
             "trend_riding": {
                 "active": bool(prev_close_4h > 0 and not is_ma5_broken),
                 "stage2_active": bool(has_stage2_now),
@@ -2352,13 +2518,9 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         }, strategy_name="떨사오팔")
     except Exception as e:
         print(f"⚠️ [STATE_SYNC] 떨사오팔 상태 동기화 오류(무시): {e}")
-    return bool(sell_orders or partial_sell_events or offset_events)
 
 
-# =========================
-# ✅ 매수 기록
-# =========================
-def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condition):
+def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condition, is_dummy=False):
     df = 매매기록불러오기()
     buy_date = datetime.now(KST).strftime("%Y-%m-%d")
 
@@ -2371,10 +2533,12 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
         "고점대비하락조건": high_drop_condition,
         "매도가": None,
         "매도일": None,
-        "매도수량": None
+        "매도수량": None,
+        "더미여부": bool(is_dummy),
     }
 
     df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
+    df["더미여부"] = df["더미여부"].apply(_to_bool_safe)
     매매기록저장(df)
 
     # 차수별 상태 파일 등록 (새로운 매수는 1단계로 진입) 후 매수가 내림차순 1~N차 정렬 동기화
@@ -2398,9 +2562,81 @@ def 매수기록(stock_code, round_number, buy_price, quantity, high_drop_condit
         offset_sold_proceeds=0.0,
         offset_used_usdt=0.0,
         offset_count=0,
+        is_dummy=bool(is_dummy),
     )
     sync_round_state_from_excel(df, stock_code)
-    print(f"{stock_code} {round_number}차 매수 기록 및 상태(1단계) 등록 완료 - 매수가: {buy_price}, 수량: {quantity}, 고점대비하락조건: {high_drop_condition}")
+    print(f"{stock_code} {round_number}차 {'[더미] ' if is_dummy else ''}매수 기록 및 상태(1단계) 등록 완료 - 매수가: {buy_price}, 수량: {quantity}, 고점대비하락조건: {high_drop_condition}")
+
+
+def _record_dummy_buy(
+    exchange,
+    symbol,
+    stock_code,
+    next_round,
+    adjusted_investment,
+    invest_money,
+    open_price,
+    current_price,
+    highest_price,
+    high_drop_condition,
+    effective_buy_drop_pct,
+    heavy_hold_note,
+    shortage_reason,
+    available_usdt=None,
+    precomputed_price=None,
+    precomputed_amount=None,
+):
+    if precomputed_price is not None and float(precomputed_price) > 0:
+        dummy_price = float(precomputed_price)
+    else:
+        try:
+            dummy_price = float(get_current_futures_price(exchange, symbol))
+        except Exception:
+            dummy_price = float(current_price)
+
+    if precomputed_amount is not None and float(precomputed_amount) > 0:
+        dummy_qty = float(precomputed_amount)
+    else:
+        dummy_qty = _safe_dummy_amount(exchange, symbol, adjusted_investment, dummy_price)
+
+    매수기록(stock_code, next_round, dummy_price, dummy_qty, high_drop_condition, is_dummy=True)
+
+    drop_rate = 0.0
+    if highest_price and highest_price > 0:
+        drop_rate = (highest_price - current_price) / highest_price * 100.0
+
+    invest_suffix = f" → 증액({HIGH_DROP_INVEST_MULTIPLIER:.1f}배) 적용" if high_drop_condition else ""
+    bal_line = (
+        f"💰 가용 잔고: {available_usdt:.2f} USDT (필요 약 {adjusted_investment:.1f} USDT)\n"
+        if available_usdt is not None and available_usdt >= 0
+        else f"💵 필요 투자금: 약 {adjusted_investment:.1f} USDT\n"
+    )
+    msg = (
+        f"👻 [보유금 부족 → 더미 매수 기록] 떨사오팔 {stock_code} {next_round}차(더미)\n"
+        f"🔹 사유: {shortage_reason}\n"
+        f"🔹 매수 조건: 현재가 ≤ 시가×{(1.0-effective_buy_drop_pct):.3f}"
+        f"{' + 고점 대비 하락조건 충족' if high_drop_condition else ''}{heavy_hold_note}\n"
+        f"{bal_line}"
+        f"📈 시가(LS): {open_price:.2f} | 💲 현재가(LS): {current_price:.2f} | 📉 가상 매수가(Bitget): {dummy_price:.4f}\n"
+        f"💵 기준 투자금(가상): {invest_money}{invest_suffix}\n"
+        f"📊 가상 수량: {dummy_qty}주\n"
+        f"📅 매수일: {datetime.now(KST).strftime('%Y-%m-%d')}\n"
+        f"📊 고점 대비 낙폭률(LS): {drop_rate:.2f}%\n"
+        f"💡 실제 Bitget 주문은 나가지 않았으며, 실제 투자금·손익차트·구제적립금에는 반영되지 않고 매매 원리만 동일 적용됩니다."
+    )
+    telegram_alert.SendMessage(msg)
+
+    sheet_logger.log_trade(
+        action="BUY",
+        symbol=symbol,
+        level=f"더미 {next_round}차",
+        price=dummy_price,
+        amount=dummy_qty,
+        is_dummy=True,
+        note=f"[더미 매수] {shortage_reason} (낙폭률 {drop_rate:.2f}%)"
+    )
+    _sync_bot_state_to_sheet(exchange, symbol, stock_code)
+    return True
 
 
 # =========================
@@ -2421,12 +2657,21 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
             print(f"⏸️ [당일 매수 완료] {stock_code}는 오늘({today_str}) 이미 {rounds_bought}차 매수가 완료되었습니다. (추가 매수 차단)")
             return False
 
-    active_cnt = len(stock_data[stock_data["매도가"].isna()]) if not stock_data.empty else 0
+    active_rows = stock_data[stock_data["매도가"].isna()] if not stock_data.empty else pd.DataFrame()
+    active_cnt = len(active_rows)
+    if not active_rows.empty and "더미여부" in active_rows.columns:
+        _act_dum_mask = active_rows["더미여부"].apply(_to_bool_safe)
+        dummy_cnt = int(_act_dum_mask.sum())
+        real_cnt = int((~_act_dum_mask).sum())
+    else:
+        dummy_cnt = 0
+        real_cnt = active_cnt
     next_round = 가능다음차수(stock_data) if not stock_data.empty else 1
     if next_round is None:
+        hold_breakdown = f" (실매수 {real_cnt}개 / 더미 {dummy_cnt}개)" if dummy_cnt > 0 else ""
         msg = (
             f"⏸️ [최대 보유 차수 제한] {stock_code} 매수 보류\n"
-            f"🔹 사유: 현재 미매도 보유 차수({active_cnt}개)가 상한({MAX_ACTIVE_ROUNDS}개)에 도달했습니다.\n"
+            f"🔹 사유: 현재 미매도 보유 차수({active_cnt}개{hold_breakdown})가 상한({MAX_ACTIVE_ROUNDS}개)에 도달했습니다.\n"
             f"💡 기존 차수 익절 또는 구제 상계 완결로 보유 차수가 줄어들면 자동 매수를 재개합니다."
         )
         telegram_alert.SendMessage(msg)
@@ -2451,49 +2696,77 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
     if current_price <= open_price * (1.0 - effective_buy_drop_pct):
         adjusted_investment = invest_money * HIGH_DROP_INVEST_MULTIPLIER if high_drop_condition else invest_money
 
-        # ✅ 보유금(가용 USDT) 사전 점검 (방안 A: Skip & Alert)
+        # ✅ 보유금(가용 USDT) 사전 점검 → 부족 시 더미 매수 차수 기록
         available_usdt = get_available_usdt(exchange)
         if 0 <= available_usdt < adjusted_investment:
-            msg = (
-                f"🚨 [보유금 부족] 떨사오팔 {stock_code} {next_round}차 매수 보류\n"
-                f"🔹 사유: 비트겟 선물 가용 USDT가 필요 투자금보다 부족합니다.\n"
-                f"💵 필요 투자금: 약 {adjusted_investment:.1f} USDT\n"
-                f"💰 가용 잔고: {available_usdt:.2f} USDT\n"
-                f"💡 조치: 비트겟 선물 계좌에 USDT를 보충하시면 다음 스케줄에 정상 매수됩니다."
+            shortage_msg = f"비트겟 선물 가용 USDT 부족 ({available_usdt:.2f} < {adjusted_investment:.1f} USDT)"
+            print(f"[더미 매수 전환 - 보유금 부족] 가용={available_usdt:.2f} USDT < 필요={adjusted_investment:.1f} USDT")
+            return _record_dummy_buy(
+                exchange=exchange,
+                symbol=symbol,
+                stock_code=stock_code,
+                next_round=next_round,
+                adjusted_investment=adjusted_investment,
+                invest_money=invest_money,
+                open_price=open_price,
+                current_price=current_price,
+                highest_price=highest_price,
+                high_drop_condition=high_drop_condition,
+                effective_buy_drop_pct=effective_buy_drop_pct,
+                heavy_hold_note=heavy_hold_note,
+                shortage_reason=shortage_msg,
+                available_usdt=available_usdt,
             )
-            telegram_alert.SendMessage(msg)
-            print(f"[매수 보류 - 보유금 부족] 가용={available_usdt:.2f} USDT < 필요={adjusted_investment:.1f} USDT")
-            return False
 
         # ✅ 주문은 Bitget 선물 (USDT ÷ 선물가), 엑셀엔 실체결값 저장(매수가=실체결가)
         futures_price = get_current_futures_price(exchange, symbol)
         amount = usdt_to_amount(exchange, symbol, adjusted_investment, futures_price)
 
-        # ✅ 주문 실행 및 잔고부족 예외 안전 처리 (사후 방어)
+        # ✅ 주문 실행 및 잔고부족 예외 안전 처리 (사후 방어 → 부족 시 더미 매수 기록)
         try:
             order, order_price = place_open_long(exchange, symbol, amount)
         except ccxt.InsufficientFunds as e:
-            msg = (
-                f"🚨 [보유금 부족] 떨사오팔 {stock_code} {next_round}차 매수 실패\n"
-                f"🔹 사유: 비트겟 거래소에서 증거금 부족(InsufficientFunds)으로 주문이 거절되었습니다.\n"
-                f"💵 주문 금액: 약 {adjusted_investment:.1f} USDT (수량: {amount})\n"
-                f"💡 조치: 비트겟 선물 계좌의 가용 증거금을 확인 후 충전해 주세요."
+            print(f"[더미 매수 전환 - 거래소 증거금 부족] {e}")
+            return _record_dummy_buy(
+                exchange=exchange,
+                symbol=symbol,
+                stock_code=stock_code,
+                next_round=next_round,
+                adjusted_investment=adjusted_investment,
+                invest_money=invest_money,
+                open_price=open_price,
+                current_price=current_price,
+                highest_price=highest_price,
+                high_drop_condition=high_drop_condition,
+                effective_buy_drop_pct=effective_buy_drop_pct,
+                heavy_hold_note=heavy_hold_note,
+                shortage_reason="거래소 증거금 부족(InsufficientFunds)",
+                available_usdt=available_usdt,
+                precomputed_price=futures_price,
+                precomputed_amount=amount,
             )
-            telegram_alert.SendMessage(msg)
-            print(f"[매수 취소 - 거래소 증거금 부족] {e}")
-            return False
         except ccxt.ExchangeError as e:
             err_str = str(e).lower()
             if any(k in err_str for k in ["margin", "balance", "fund", "insufficient", "40754", "40762"]):
-                msg = (
-                    f"🚨 [보유금 부족] 떨사오팔 {stock_code} {next_round}차 매수 실패\n"
-                    f"🔹 사유: 비트겟 거래소 증거금 부족 오류 ({e})\n"
-                    f"💵 주문 금액: 약 {adjusted_investment:.1f} USDT\n"
-                    f"💡 조치: 증거금을 충전하시면 다음 스케줄에 정상 실행됩니다."
+                print(f"[더미 매수 전환 - 비트겟 증거금 에러] {e}")
+                return _record_dummy_buy(
+                    exchange=exchange,
+                    symbol=symbol,
+                    stock_code=stock_code,
+                    next_round=next_round,
+                    adjusted_investment=adjusted_investment,
+                    invest_money=invest_money,
+                    open_price=open_price,
+                    current_price=current_price,
+                    highest_price=highest_price,
+                    high_drop_condition=high_drop_condition,
+                    effective_buy_drop_pct=effective_buy_drop_pct,
+                    heavy_hold_note=heavy_hold_note,
+                    shortage_reason=f"거래소 증거금 부족 오류 ({e})",
+                    available_usdt=available_usdt,
+                    precomputed_price=futures_price,
+                    precomputed_amount=amount,
                 )
-                telegram_alert.SendMessage(msg)
-                print(f"[매수 취소 - 비트겟 증거금 에러] {e}")
-                return False
             raise
 
         print("[매수주문]", order)
@@ -2511,7 +2784,7 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
         real_buy_price, real_buy_qty, _ = 체결가_조회(exchange, symbol, order, fallback_buy, amount)
         buy_amt = real_buy_qty
 
-        매수기록(stock_code, next_round, real_buy_price, buy_amt, high_drop_condition)
+        매수기록(stock_code, next_round, real_buy_price, buy_amt, high_drop_condition, is_dummy=False)
 
         drop_rate = 0.0
         if highest_price and highest_price > 0:
@@ -2540,33 +2813,7 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
             amount=buy_amt,
             note=f"떨사 분할 매수 실행 (낙폭률 {drop_rate:.2f}%)"
         )
-        try:
-            latest_state = load_round_state()
-            latest_stock_state = latest_state.get(stock_code, {})
-            latest_rounds = latest_stock_state.get("rounds", {})
-            has_stage2_now = any(r.get("stage") == 2 for r in latest_rounds.values())
-            rescue_cnt = sum(1 for r in latest_rounds.values() if r.get("rescue_mode"))
-            is_ma5_broken, prev_close_4h, ma5_4h = get_trend_ma_status(exchange, symbol)
-            sheet_logger.log_bot_state({
-                "symbol": symbol,
-                "stock_code": stock_code,
-                "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                "offset_pool_usdt": round(_safe_nonneg_float(latest_stock_state.get("offset_pool_usdt", 0.0), 0.0), 4),
-                "rescue_rounds_cnt": int(rescue_cnt),
-                "trend_riding": {
-                    "active": bool(prev_close_4h > 0 and not is_ma5_broken),
-                    "stage2_active": bool(has_stage2_now),
-                    "prev_close_4h": round(float(prev_close_4h), 4),
-                    "ma5_4h": round(float(ma5_4h), 4),
-                    "timeframe": TREND_TIMEFRAME,
-                    "ma_period": TREND_MA_PERIOD,
-                    "ma_buffer_pct": TREND_MA_BUFFER_PCT,
-                    "stage1_partial_sell_pct": STAGE1_PARTIAL_SELL_PCT,
-                },
-                "rounds": latest_rounds,
-            }, strategy_name="떨사오팔")
-        except Exception as e:
-            print(f"⚠️ [STATE_SYNC] 떨사오팔 매수 후 상태 동기화 오류(무시): {e}")
+        _sync_bot_state_to_sheet(exchange, symbol, stock_code)
 
         return True
 
