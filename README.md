@@ -475,7 +475,7 @@
   - `python -m py_compile bitget_Ejftkdhvkf.py` 정적 구문 검사 통과 (종료 코드 0)
   - GitHub 원격 저장소 푸시 및 EC2 실서버(`/var/autobot/bitget_Ejftkdhvkf/`) 배포·원격 구문 검증 완료
 
-## [2026-11-25 14:04] 업데이트 이력 (Commit ID: PENDING)
+## [2026-11-25 14:04] 업데이트 이력 (Commit ID: 49fb8ae)
 - **발생 문제**:
   - 2026-11-25 05:51 KST(미국 동부 15:51 EST) 일일 점검 시 전날 구제 부분 상계 후 남은 소액 적립금(`offset_pool_usdt = 0.239683 USDT`)으로 산출된 상계 수량(`≈ 0.00225주`)이 Bitget `SOXL/USDT:USDT` 최소 수량 정밀도(`0.01주`) 미만이어서 `execute_offset_rescue()` 내 `exchange.amount_to_precision()` 호출 시 `ccxt.InvalidOrder` 예외로 크래시 발생
   - 이로 인해 `매도체크()`의 매도 없음 알림 및 후속 `매수체크()`가 모두 중단되어 아침 매도·매수 메시지가 미발송됨
