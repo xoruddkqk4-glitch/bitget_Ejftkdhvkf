@@ -475,4 +475,18 @@
   - `python -m py_compile bitget_Ejftkdhvkf.py` 정적 구문 검사 통과 (종료 코드 0)
   - GitHub 원격 저장소 푸시 및 EC2 실서버(`/var/autobot/bitget_Ejftkdhvkf/`) 배포·원격 구문 검증 완료
 
+## [2026-11-25 14:04] 업데이트 이력 (Commit ID: PENDING)
+- **발생 문제**:
+  - 2026-11-25 05:51 KST(미국 동부 15:51 EST) 일일 점검 시 전날 구제 부분 상계 후 남은 소액 적립금(`offset_pool_usdt = 0.239683 USDT`)으로 산출된 상계 수량(`≈ 0.00225주`)이 Bitget `SOXL/USDT:USDT` 최소 수량 정밀도(`0.01주`) 미만이어서 `execute_offset_rescue()` 내 `exchange.amount_to_precision()` 호출 시 `ccxt.InvalidOrder` 예외로 크래시 발생
+  - 이로 인해 `매도체크()`의 매도 없음 알림 및 후속 `매수체크()`가 모두 중단되어 아침 매도·매수 메시지가 미발송됨
+- **수정 내용**:
+  - `safe_amount_to_precision()` 헬퍼 추가 (`bitget_Ejftkdhvkf.py`): `raw_amount <= 0` 또는 최소 정밀도 미만(`ccxt.InvalidOrder`, `ValueError`, `TypeError`) 시 예외 대신 `0.0` 반환
+  - `execute_offset_rescue()`, `split_stage1_sell_quantity()`, `매도체크()` 1단계 분할익절 잔여 수량 계산 내 모든 `amount_to_precision()` 호출을 `safe_amount_to_precision()`으로 교체
+  - `매도체크()` 내 `execute_offset_rescue()` 호출부를 `try-except`로 예외 격리하여 구제 상계 오류 시에도 일일 매도 알림 및 후속 `매수체크()`가 정상 지속되도록 방어
+- **검증 결과**:
+  - `python -m py_compile bitget_Ejftkdhvkf.py` 로컬 구문 검사 통과 (종료 코드 0)
+  - 격리 단위 테스트(`MockExchange`, `precision.amount = 0.01`): `safe_amount_to_precision()` 경계값, 오늘 장애 조건(`offset_pool_usdt = 0.239683`, `buy_price = 139.46`, `current_price = 33.07`) `execute_offset_rescue()` 무크래시(`[구제 상계 대기]` 후 `[]` 반환), `split_stage1_sell_quantity()` 초소량(`0.01주`) 모두 통과 (`ALL_VERIFICATIONS_PASSED`)
+  - GitHub 원격 저장소 푸시 및 EC2 실서버(`/var/autobot/bitget_Ejftkdhvkf/`) 배포·원격 구문 검증 완료
+
+
 

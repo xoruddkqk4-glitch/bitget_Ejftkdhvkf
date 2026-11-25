@@ -173,6 +173,24 @@ def usdt_to_amount(exchange, symbol, usdt_amount, price):
         raise RuntimeError("주문수량이 0 이하입니다.")
     return amount
 
+def safe_amount_to_precision(exchange, symbol, raw_amount) -> float:
+    """
+    거래소 수량 정밀도로 안전하게 변환.
+    raw_amount <= 0 이거나 최소 수량 정밀도(precision.amount) 미만으로
+    ccxt.InvalidOrder 등이 발생하면 예외 대신 0.0을 반환합니다.
+    """
+    try:
+        val = float(raw_amount)
+    except (TypeError, ValueError):
+        return 0.0
+    if val <= 0:
+        return 0.0
+    try:
+        amt = float(exchange.amount_to_precision(symbol, val))
+        return amt if amt > 0 else 0.0
+    except (ccxt.InvalidOrder, ValueError, TypeError):
+        return 0.0
+
 def _safe_dummy_amount(exchange, symbol, usdt_amount, price):
     """더미 매수 가상 수량 산출 (최소주문 수량 미달 시에도 정밀도 폴백으로 안전 기록)."""
     try:
@@ -206,8 +224,8 @@ def split_stage1_sell_quantity(exchange, symbol, total_qty, current_price, ratio
 
     total_qty_f = float(total_qty)
     raw_part1 = total_qty_f * float(ratio)
-    part1_qty = float(exchange.amount_to_precision(symbol, raw_part1))
-    rem_qty = float(exchange.amount_to_precision(symbol, max(0.0, total_qty_f - part1_qty)))
+    part1_qty = safe_amount_to_precision(exchange, symbol, raw_part1)
+    rem_qty = safe_amount_to_precision(exchange, symbol, max(0.0, total_qty_f - part1_qty))
 
     if part1_qty <= 0 or rem_qty <= 0:
         return 0.0, total_qty_f, False
@@ -1488,7 +1506,7 @@ def execute_offset_rescue(exchange, symbol, stock_code, df, current_price, curre
 
         loss_per_share = buy_price_f - (float(current_price) * (1.0 - SELL_FEE_RATE))
         if loss_per_share <= 0:
-            sell_qty = float(exchange.amount_to_precision(symbol, rem_qty))
+            sell_qty = safe_amount_to_precision(exchange, symbol, rem_qty)
             if sell_qty <= 0 or (min_amt_f > 0 and sell_qty < min_amt_f) or (sell_qty * float(current_price) < min_cost_f):
                 print(f"[구제 상계 대기] {stock_code} {r_num}차 최소 주문수량/금액 미달 (수량={sell_qty})")
                 break
@@ -1496,16 +1514,16 @@ def execute_offset_rescue(exchange, symbol, stock_code, df, current_price, curre
         else:
             raw_offset_qty = pool_usdt / loss_per_share
             if raw_offset_qty >= rem_qty - 1e-8:
-                sell_qty = float(exchange.amount_to_precision(symbol, rem_qty))
+                sell_qty = safe_amount_to_precision(exchange, symbol, rem_qty)
                 if sell_qty <= 0 or (min_amt_f > 0 and sell_qty < min_amt_f) or (sell_qty * float(current_price) < min_cost_f):
                     print(f"[구제 전량 상계 불가] {stock_code} {r_num}차 최소주문 조건 미달 (수량={sell_qty}, 금액={sell_qty * float(current_price):.2f})")
                     break
                 is_full_close = True
             else:
-                part_qty = float(exchange.amount_to_precision(symbol, raw_offset_qty))
+                part_qty = safe_amount_to_precision(exchange, symbol, raw_offset_qty)
                 if part_qty * loss_per_share > pool_usdt + 1e-6 and part_qty > 0:
                     fit_ratio = (pool_usdt / (part_qty * loss_per_share)) * 0.995
-                    part_qty = float(exchange.amount_to_precision(symbol, part_qty * fit_ratio))
+                    part_qty = safe_amount_to_precision(exchange, symbol, part_qty * fit_ratio)
 
                 after_rem = round(max(0.0, rem_qty - part_qty), 8)
                 if after_rem > 0 and (
@@ -1517,9 +1535,9 @@ def execute_offset_rescue(exchange, symbol, stock_code, df, current_price, curre
                         min_amt_f,
                     )
                     max_safe_part = max(0.0, rem_qty - safe_target_rem)
-                    part_qty = float(exchange.amount_to_precision(symbol, max_safe_part)) if max_safe_part > 0 else 0.0
+                    part_qty = safe_amount_to_precision(exchange, symbol, max_safe_part)
                     if part_qty > 0 and (rem_qty - part_qty) * float(current_price) < min_dust_usdt - 1e-6:
-                        part_qty = float(exchange.amount_to_precision(symbol, max_safe_part * 0.98)) if max_safe_part * 0.98 > 0 else 0.0
+                        part_qty = safe_amount_to_precision(exchange, symbol, max_safe_part * 0.98)
 
                 if (
                     part_qty <= 0
@@ -1558,7 +1576,7 @@ def execute_offset_rescue(exchange, symbol, stock_code, df, current_price, curre
         if raw_left <= 1e-8:
             new_rem_qty = 0.0
         else:
-            new_rem_qty = float(exchange.amount_to_precision(symbol, raw_left))
+            new_rem_qty = safe_amount_to_precision(exchange, symbol, raw_left)
         if new_rem_qty <= 0 or (min_amt_f > 0 and new_rem_qty < min_amt_f):
             is_full_close = True
             new_rem_qty = 0.0
@@ -1926,7 +1944,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                                 exchange, symbol, p_order, fallback_part1, part1_qty
                             )
 
-                        rem_qty = float(exchange.amount_to_precision(symbol, max(0.0, float(quantity) - float(real_part1_qty))))
+                        rem_qty = safe_amount_to_precision(exchange, symbol, max(0.0, float(quantity) - float(real_part1_qty)))
                         now_kst_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
                         part1_net_sell = float(real_part1_price) * (1.0 - SELL_FEE_RATE)
@@ -2305,7 +2323,11 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         rounds_dict = state.get(stock_code, {}).get("rounds", {})
 
     # D 전략(트랙 B): 누적 구제 적립금이 있으면 최우선 구제 대기 차수 자동 부분/전량 상계 소각
-    offset_events = execute_offset_rescue(exchange, symbol, stock_code, df, current_price, current_invest_money)
+    try:
+        offset_events = execute_offset_rescue(exchange, symbol, stock_code, df, current_price, current_invest_money)
+    except Exception as e:
+        print(f"[구제 상계 오류(격리)] {stock_code} 구제 상계 처리 중 예외 발생(매도 알림 및 매수 점검은 계속 진행): {e}")
+        offset_events = []
     if offset_events:
         state = sync_round_state_from_excel(df, stock_code)
         rounds_dict = state.get(stock_code, {}).get("rounds", {})
