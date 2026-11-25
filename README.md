@@ -488,17 +488,17 @@
   - 격리 단위 테스트(`MockExchange`, `precision.amount = 0.01`): `safe_amount_to_precision()` 경계값, 오늘 장애 조건(`offset_pool_usdt = 0.239683`, `buy_price = 139.46`, `current_price = 33.07`) `execute_offset_rescue()` 무크래시(`[구제 상계 대기]` 후 `[]` 반환), `split_stage1_sell_quantity()` 초소량(`0.01주`) 모두 통과 (`ALL_VERIFICATIONS_PASSED`)
   - GitHub 원격 저장소 푸시 및 EC2 실서버(`/var/autobot/bitget_Ejftkdhvkf/`) 배포·원격 구문 검증 완료
 
-## [2026-11-25 14:15] 업데이트 이력 (Commit ID: PENDING)
+## [2026-11-25 14:15] 업데이트 이력 (Commit ID: 7d33a62)
 - **발생 문제**:
-  - `manual_buy.py` 실행 시 `[떨사오팔] 시트 응답 에러: 인증에 실패했습니다.` 발생으로 10차 수동 매수 체결 내역이 대시보드/구글 시트에 즉시 반영되지 않음 (`manual_buy.py` 내 구 하드코딩 `webhook_url` 및 `auth_token="trading_secret_2026"` 잔존)
-  - `manual_buy.py`에 대시보드 보유 현황 갱신용 `STATE_SYNC`(`log_bot_state`) 및 종료 전 `flush()`가 없어 단발 실행 종료 시 최신 보유 차수 상태가 대시보드에 즉시 반영되지 않던 구조 보완 필요
+  - `manual_buy.py` 실행 시 상단 `SheetsLogger`에 예전 하드코딩 값(`webhook_url`, `auth_token="trading_secret_2026"`)이 남아 있어 `/var/autobot/gsheet.env`의 실제 토큰 대신 구 토큰으로 전송되며 구글 시트 인증 실패 발생 (`sheets_outbox_42f4fb1b.jsonl`에 10차 체결 적체)
+  - 또한 `manual_buy.py`에 대시보드 상태 동기화(`STATE_SYNC`) 및 종료 전 `flush()` 호출이 누락되어 수동 매수 직후 대시보드 보유 현황이 갱신되지 않던 현상 확인
 - **수정 내용**:
-  - `manual_buy.py` 내 `SheetsLogger` 초기화의 하드코딩된 `webhook_url`·`auth_token` 제거 (`/var/autobot/gsheet.env` 환경변수 자동 로드 통일)
-  - `manual_buy.py`에 `get_trend_ma_status()` 및 `_sync_bot_state_to_sheet()` 추가 (`TREND_TIMEFRAME`, `TREND_MA_PERIOD`, `TREND_OHLCV_LIMIT`, `TREND_MA_BUFFER_PCT`, `STAGE1_PARTIAL_SELL_PCT` 포함)
-  - `execute_manual_buy()` 내 `sheet_logger.log_trade()` 직후 `_sync_bot_state_to_sheet()` 및 `sheet_logger.flush(timeout=10.0)` 호출 추가
+  - `manual_buy.py`의 `SheetsLogger` 하드코딩 `webhook_url`·`auth_token` 제거 → `/var/autobot/gsheet.env` 자동 로드 통일
+  - `manual_buy.py`에 `get_trend_ma_status()`, `_sync_bot_state_to_sheet()` 추가 및 수동 매수 완료 직후 `STATE_SYNC` 전송 + `sheet_logger.flush(timeout=10.0)` 호출 추가
+  - EC2 실서버 outbox(`sheets_outbox_42f4fb1b.jsonl`) `_flush_outbox()` 즉시 재전송 및 최신 1~10차 `STATE_SYNC` 동기화 완료
 - **검증 결과**:
   - `python -m py_compile manual_buy.py` 로컬 구문 검사 통과 (종료 코드 0)
-  - EC2 실서버에서 미전송 10차 수동 매수 outbox(`sheets_outbox_42f4fb1b.jsonl`) `_flush_outbox()` 즉시 전송 완료 (`OUTBOX_EXISTS_AFTER=False`) 및 1~10차 `STATE_SYNC` 전송 성공(`STATE_SYNC_OK=True`) 확인
+  - EC2 실서버 outbox 비움 확인(`OUTBOX_EXISTS_AFTER: False`) 및 `STATE_SYNC` 성공 확인(`STATE_SYNC_OK: True, ROUNDS_COUNT: 10`)
   - GitHub 원격 저장소 푸시 및 EC2 실서버(`/var/autobot/bitget_Ejftkdhvkf/manual_buy.py`) 배포·원격 구문 검증 완료
 
 
