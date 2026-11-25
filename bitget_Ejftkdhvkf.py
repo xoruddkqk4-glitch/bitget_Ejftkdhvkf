@@ -1989,6 +1989,8 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                             if is_dummy
                             else f"🎯 [1차 목표가 돌파 & {part1_pct_str} 분할익절] {stock_code} {round_number}차 2단계 승격"
                         )
+                        if is_dummy:
+                            part1_pool_note += f"\n👻 가상 손익(참고): {part1_pnl:+.4f} USDT"
                         msg = (
                             f"{p1_header}\n"
                             f"🔹 1차 {'가상 ' if is_dummy else ''}익절({part1_pct_str}): {real_part1_qty}주 체결 (체결가 {real_part1_price:.4f} / 수익률 {part1_profit_pct:+.2f}%)\n"
@@ -2014,6 +2016,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
                             close_all=False,
                             note=(
                                 f"[더미 가상분할익절] 1단계 목표가 돌파 {part1_pct_str} (잔여 {rem_qty}주 2단계 승격, 보존선 {target_price:.2f})"
+                                f" | 가상참고 {part1_profit_pct:+.2f}% ({part1_pnl:+.4f} USDT)"
                                 if is_dummy
                                 else f"1단계 목표가 돌파 {part1_pct_str} 분할익절 (잔여 {rem_qty}주 2단계 승격, 보존선 {target_price:.2f})"
                             ),
@@ -2185,7 +2188,13 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
             df.at[index, "조정률(수익률/7)(%)"] = 0.0
             df.at[index, "다음투자금"] = next_invest_money
             df.at[index, "더미여부"] = True
-            pool_msg_suffix = "\n👻 실제 주문 없음 (더미 가상청산 / 투자금·손익차트·구제적립금 미반영)"
+            dummy_this_pnl = ((float(real_sell_price) * (1.0 - SELL_FEE_RATE)) - buy_price_f) * float(real_sell_qty) if buy_price_f > 0 else 0.0
+            dummy_p1_pnl = ((float(part1_price_done) * (1.0 - SELL_FEE_RATE) - buy_price_f) * float(part1_qty_done)) if (has_part1 and buy_price_f > 0) else 0.0
+            dummy_total_line = f" / 합산 {dummy_this_pnl + dummy_p1_pnl:+.4f} USDT" if has_part1 else ""
+            pool_msg_suffix = (
+                f"\n👻 가상 손익(참고): {dummy_this_pnl:+.4f} USDT (금회){dummy_total_line}"
+                "\n👻 실제 주문 없음 (더미 가상청산 / 투자금·손익차트·구제적립금 미반영)"
+            )
         else:
             # 구제 적립금 적립 / 손실 보전 및 복리 조정률 왜곡 방지
             this_net_sell = float(real_sell_price) * (1.0 - SELL_FEE_RATE)
@@ -2300,6 +2309,7 @@ def 매도체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None,
         )
         sheet_note = (
             f"[더미 가상청산] {sell_reason} (가상수익률 {profit_pct:+.2f}%, 실제자금 미반영)"
+            f" | 가상참고 {(part2_pct if has_part1 else profit_pct):+.2f}% ({real_pnl:+.4f} USDT)"
             if is_dummy
             else (f"{sell_reason} (합산수익률 {profit_pct:.2f}%, 조정률 {adj_pct:+.2f}%)" if has_part1 else f"{sell_reason} (조정률 {adj_pct:+.2f}%)")
         )

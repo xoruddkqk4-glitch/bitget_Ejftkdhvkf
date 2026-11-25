@@ -502,5 +502,31 @@
   - GitHub 원격 저장소 푸시 및 EC2 실서버(`/var/autobot/bitget_Ejftkdhvkf/manual_buy.py`) 배포·원격 구문 검증 완료
 
 
+## [2026-11-25 14:15] 업데이트 이력 (Commit ID: PENDING)
+- **발생 문제**:
+  - `manual_buy.py` 실행 시 상단 `SheetsLogger`에 예전 하드코딩 값(`webhook_url`, `auth_token="trading_secret_2026"`)이 남아 있어 `/var/autobot/gsheet.env`의 실제 토큰 대신 구 토큰으로 전송되며 구글 시트 인증 실패 발생 (`sheets_outbox_42f4fb1b.jsonl`에 10차 체결 적체)
+  - 또한 `manual_buy.py`에 대시보드 상태 동기화(`STATE_SYNC`) 및 종료 전 `flush()` 호출이 누락되어 수동 매수 직후 대시보드 보유 현황이 갱신되지 않던 현상 확인
+- **수정 내용**:
+  - `manual_buy.py`의 `SheetsLogger` 하드코딩 `webhook_url`·`auth_token` 제거 → `/var/autobot/gsheet.env` 자동 로드 통일
+  - `manual_buy.py`에 `get_trend_ma_status()`, `_sync_bot_state_to_sheet()` 추가 및 수동 매수 완료 직후 `STATE_SYNC` 전송 + `sheet_logger.flush(timeout=10.0)` 호출 추가
+  - EC2 실서버 outbox(`sheets_outbox_42f4fb1b.jsonl`) `_flush_outbox()` 즉시 재전송 및 최신 1~10차 `STATE_SYNC` 동기화 완료
+- **검증 결과**:
+  - `python -m py_compile manual_buy.py` 로컬 구문 검사 통과 (종료 코드 0)
+  - EC2 실서버 outbox 비움 확인(`OUTBOX_EXISTS_AFTER: False`) 및 `STATE_SYNC` 성공 확인(`STATE_SYNC_OK: True, ROUNDS_COUNT: 10`)
+  - GitHub 원격 저장소 푸시 및 EC2 실서버(`/var/autobot/bitget_Ejftkdhvkf/manual_buy.py`) 배포·원격 구문 검증 완료
 
 
+
+
+
+
+## [2026-11-25 21:33] 업데이트 이력 (Commit ID: PENDING)
+- **요청 사항**:
+  - 떨사오팔·그리드·장기투자 전략의 더미 매도 발생 시 가상 수익금(USDT) 및 보유 중인 더미 차수의 현재가 기준 가상 평가손익을 대시보드에서 확인할 수 있도록 구현 요청 (계획서 작성 후 `/apply` 반영)
+- **수정 내용**:
+  - **계획서 작성**: `.plan/2026-11-25_2119_더미매도_가상손익_및_더미평가손익_대시보드표시_계획서.md`
+  - **떨사오팔봇 (`bitget_Ejftkdhvkf.py`)**:
+    - 1차 가상 분할익절(`L2016`) 및 최종 가상청산(`L2311`) `sheet_logger.log_trade()` `note`에 `| 가상참고 ±x.xx% (±y.yyyy USDT)` 형식 추가 (`pnl=0.0`, `fee=0.0`, `is_dummy=True` 격리 유지)
+    - 텔레그램 더미 매도 알림에 `👻 가상 손익(참고)`(금회 / 1·2차 합산 USDT) 라인 추가
+- **검증 결과**:
+  - `python -m py_compile bitget_Ejftkdhvkf.py` 정적 구문 검사 통과 (종료 코드 0)
