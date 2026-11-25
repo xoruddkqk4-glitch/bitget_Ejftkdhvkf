@@ -48,8 +48,7 @@ import LS_API_Helper_US_new as LsiUS
 # --- 구글 시트 로거 임포트 ---
 from sheets_logger import SheetsLogger
 sheet_logger = SheetsLogger(
-    webhook_url="https://script.google.com/macros/s/AKfycbws77Zb7aGqs_L5K0yLDf5iDVBXHKO_abf5eL1vlvUTh4197W-dujvmxm-vEBj8Hjdq/exec",
-    auth_token="trading_secret_2026",
+    # webhook_url / auth_token 은 환경변수 GSHEET_WEBHOOK_URL / GSHEET_AUTH_TOKEN (/var/autobot/gsheet.env) 에서 읽습니다
     strategy_name="떨사오팔",
     exchange="Bitget"
 )
@@ -95,6 +94,11 @@ LOOKBACK_DAYS = 40               # 고점 탐색 기간
 MAX_ACTIVE_ROUNDS = 15           # 최대 동시 보유 허용 차수 (초과 시 기본 매수 보류)
 HEAVY_HOLD_ROUND_THRESHOLD = 10  # 다차수 과부하 기준 (10개 이상 보유 시 매수 하락 기준 강화)
 HEAVY_HOLD_BUY_DROP_PCT = 0.030  # 다차수 과부하 구간 시가 대비 하락 매수 기준 (-3.0%)
+TREND_TIMEFRAME = "1h"
+TREND_MA_PERIOD = 5
+TREND_OHLCV_LIMIT = 10
+TREND_MA_BUFFER_PCT = 0.004
+STAGE1_PARTIAL_SELL_PCT = 50
 DATA_RETRY_COUNT = 5
 DATA_RETRY_SLEEP_SEC = 4
 
@@ -259,6 +263,26 @@ def 체결가_조회(exchange, symbol, order_result, fallback_price, fallback_qt
     print(f"⚠️ 체결가 조회 실패 → fallback 사용 (가격={fallback_price}, 수량={fallback_qty})")
     return float(fallback_price), float(fallback_qty), float(fallback_price) * float(fallback_qty)
 
+def get_trend_ma_status(exchange, symbol):
+    """직전 완성봉 종가 대비 TREND_MA_PERIOD MA 추세 이탈 여부를 반환합니다."""
+    try:
+        min_candles = TREND_MA_PERIOD + 2
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TREND_TIMEFRAME, limit=TREND_OHLCV_LIMIT)
+        if not ohlcv or len(ohlcv) < min_candles:
+            return False, 0.0, 0.0
+        df_candle = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_candle["close"] = pd.to_numeric(df_candle["close"], errors="coerce")
+        completed_n = df_candle["close"].iloc[-(TREND_MA_PERIOD + 1):-1]
+        ma_val = float(completed_n.mean())
+        prev_close = float(df_candle["close"].iloc[-2])
+        buf_pct = float(TREND_MA_BUFFER_PCT)
+        buf_ratio = (buf_pct / 100.0) if buf_pct >= 0.05 else max(0.0, buf_pct)
+        is_broken = prev_close < (ma_val * (1.0 - buf_ratio))
+        return is_broken, prev_close, ma_val
+    except Exception as e:
+        print(f"[{TREND_TIMEFRAME} {TREND_MA_PERIOD}MA 조회 에러] {e}")
+        return False, 0.0, 0.0
+
 # =========================
 # ✅ 상태 관리 및 엑셀 함수
 # =========================
@@ -271,6 +295,44 @@ def load_round_state():
     except Exception as e:
         print(f"[상태파일 로드 실패] {e}")
         return {}
+
+def _sync_bot_state_to_sheet(exchange, symbol, stock_code):
+    """대시보드 및 구글 시트 상태(STATE_SYNC)를 최신 보유 차수로 동기화합니다."""
+    try:
+        latest_state = load_round_state()
+        latest_stock_state = latest_state.get(stock_code, {})
+        latest_rounds = latest_stock_state.get("rounds", {})
+        has_stage2_now = any(r.get("stage") == 2 for r in latest_rounds.values())
+        rescue_cnt = sum(1 for r in latest_rounds.values() if r.get("rescue_mode") and not r.get("is_dummy"))
+        real_rounds_cnt = sum(1 for r in latest_rounds.values() if not r.get("is_dummy"))
+        dummy_rounds_cnt = sum(1 for r in latest_rounds.values() if r.get("is_dummy"))
+        is_ma5_broken, prev_close_4h, ma5_4h = get_trend_ma_status(exchange, symbol)
+        try:
+            offset_pool = max(0.0, float(latest_stock_state.get("offset_pool_usdt", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            offset_pool = 0.0
+        sheet_logger.log_bot_state({
+            "symbol": symbol,
+            "stock_code": stock_code,
+            "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "offset_pool_usdt": round(offset_pool, 4),
+            "rescue_rounds_cnt": int(rescue_cnt),
+            "real_rounds_cnt": int(real_rounds_cnt),
+            "dummy_rounds_cnt": int(dummy_rounds_cnt),
+            "trend_riding": {
+                "active": bool(prev_close_4h > 0 and not is_ma5_broken),
+                "stage2_active": bool(has_stage2_now),
+                "prev_close_4h": round(float(prev_close_4h), 4),
+                "ma5_4h": round(float(ma5_4h), 4),
+                "timeframe": TREND_TIMEFRAME,
+                "ma_period": TREND_MA_PERIOD,
+                "ma_buffer_pct": TREND_MA_BUFFER_PCT,
+                "stage1_partial_sell_pct": STAGE1_PARTIAL_SELL_PCT,
+            },
+            "rounds": latest_rounds,
+        }, strategy_name="떨사오팔")
+    except Exception as e:
+        print(f"⚠️ [STATE_SYNC] 떨사오팔 상태 동기화 오류(무시): {e}")
 
 def save_round_state(state):
     try:
@@ -853,7 +915,7 @@ def execute_manual_buy(check_only: bool = False, force: bool = False):
     )
     telegram_alert.SendMessage(msg)
 
-    # 구글 시트 웹훅 전송
+    # 구글 시트 웹훅 전송 및 대시보드 상태 동기화
     try:
         sheet_logger.log_trade(
             action="BUY",
@@ -863,6 +925,8 @@ def execute_manual_buy(check_only: bool = False, force: bool = False):
             amount=buy_amt,
             note=f"떨사 수동 매수 실행 (낙폭률 {high_drop_rate:.2f}%)"
         )
+        _sync_bot_state_to_sheet(exchange, symbol, stock_code)
+        sheet_logger.flush(timeout=10.0)
     except Exception as e:
         print(f"[구글 시트 로깅 경고] {e}")
 
