@@ -531,7 +531,7 @@
 - **검증 결과**:
   - `python -m py_compile bitget_Ejftkdhvkf.py` 정적 구문 검사 통과 (종료 코드 0)
 
-## [2026-11-28 11:05] 업데이트 이력 (Commit ID: PENDING)
+## [2026-11-28 11:05] 업데이트 이력 (Commit ID: 1168747)
 - **요청 사항**:
   - 미국 정규장 조기폐장일(Early Close, `13:00 ET`) 및 휴장일 발생 시 일일 매도/매수 점검 시각을 동적으로 자동 반영하도록 개선 (`bitget_Ejftkdhvkf.py` 수정 내역 커밋 및 배포)
 - **수정 내용**:
