@@ -51,6 +51,7 @@ import pandas as pd
 import pprint
 import os
 import json
+import tempfile
 
 import telegram_alert
 
@@ -69,6 +70,95 @@ KST = ZoneInfo("Asia/Seoul")
 US_EASTERN = ZoneInfo("America/New_York")
 DAILY_CHECK_ET_HOUR = 15    # 미국 정규장 마감(16:00 ET) 10분 전 시각(시)
 DAILY_CHECK_ET_MINUTE = 51  # 미국 정규장 마감(16:00 ET) 10분 전 시각(분)
+
+# --- 미국 정규장 마감 시각 하이브리드 판별 (pandas_market_calendars + 표준 라이브러리 폴백 + 일일 파일 캐시) ---
+US_EARLY_CLOSE_OVERRIDES = {}  # 돌발 임시 조기폐장 수동 지정 예: {"2026-12-31": (13, 0)}
+_US_CLOSE_CACHE_PATH = os.path.join(tempfile.gettempdir(), "us_market_close_cache.json")
+_US_CLOSE_MEM_CACHE = {}
+
+
+def _get_us_market_close_et_rule(target_date):
+    """표준 라이브러리 기반 NYSE 정례 조기폐장(13:00 ET) 폴백 규칙."""
+    wd = target_date.weekday()
+    if wd >= 5:
+        return None
+    ds = target_date.isoformat()
+    if ds in US_EARLY_CLOSE_OVERRIDES:
+        return tuple(US_EARLY_CLOSE_OVERRIDES[ds])
+    # 1) 독립기념일 전날 (7/3 평일 월~목), 2) 블랙 프라이데이 (11월 넷째 주 금요일), 3) 크리스마스 이브 (12/24 평일 월~목)
+    if (
+        (target_date.month == 7 and target_date.day == 3 and wd < 4)
+        or (target_date.month == 11 and wd == 4 and 23 <= target_date.day <= 29)
+        or (target_date.month == 12 and target_date.day == 24 and wd < 4)
+    ):
+        return (13, 0)
+    return (16, 0)
+
+
+def get_us_market_close_et(target_date=None):
+    """미국 정규장 마감 시각(ET (hour, minute)) 반환. 휴장일/주말은 None."""
+    if target_date is None:
+        target_date = datetime.now(US_EASTERN).date()
+    elif isinstance(target_date, datetime):
+        target_date = target_date.date()
+    if target_date.weekday() >= 5:
+        return None
+
+    ds = target_date.isoformat()
+    if ds in US_EARLY_CLOSE_OVERRIDES:
+        return tuple(US_EARLY_CLOSE_OVERRIDES[ds])
+    if ds in _US_CLOSE_MEM_CACHE:
+        val = _US_CLOSE_MEM_CACHE[ds]
+        return tuple(val) if val is not None else None
+
+    file_cache = {}
+    try:
+        if os.path.exists(_US_CLOSE_CACHE_PATH):
+            with open(_US_CLOSE_CACHE_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    file_cache = loaded
+            if ds in file_cache and isinstance(file_cache[ds], dict) and "close" in file_cache[ds]:
+                val = file_cache[ds]["close"]
+                res = tuple(val) if val is not None else None
+                _US_CLOSE_MEM_CACHE[ds] = res
+                return res
+    except Exception:
+        file_cache = {}
+
+    try:
+        import pandas_market_calendars as mcal
+        nyse = mcal.get_calendar("NYSE")
+        sched = nyse.schedule(start_date=ds, end_date=ds)
+        if sched.empty:
+            result = None
+        else:
+            close_dt = sched.iloc[0]["market_close"].tz_convert(US_EASTERN)
+            result = (int(close_dt.hour), int(close_dt.minute))
+        source = "pmc"
+    except Exception:
+        result = _get_us_market_close_et_rule(target_date)
+        source = "rule"
+
+    _US_CLOSE_MEM_CACHE[ds] = result
+    try:
+        file_cache[ds] = {"close": list(result) if result is not None else None, "source": source}
+        if len(file_cache) > 30:
+            for old_k in sorted(file_cache.keys())[:-30]:
+                file_cache.pop(old_k, None)
+        with open(_US_CLOSE_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(file_cache, f)
+    except Exception:
+        pass
+    return result
+
+
+def get_daily_check_et_hour(now_et=None):
+    """당일 미국 정규장 마감 10분 전 기준 시각(시, 정규장 15 / 조기폐장 12) 반환. 휴장일은 None."""
+    if now_et is None:
+        now_et = datetime.now(US_EASTERN)
+    close_et = get_us_market_close_et(now_et.date())
+    return (close_et[0] - 1) if close_et is not None else None
 
 # [구글 시트 연동 로거 추가]
 from sheets_logger import SheetsLogger
@@ -2874,21 +2964,24 @@ def 매수체크(exchange, symbol, stock_code, default_invest_money, ohlcv=None)
 # ✅ 매수/매도 프로세스
 # =========================
 def 매수매도프로세스(exchange, symbol, stock_code, default_invest_money):
-    # 1. 일일 매수/매도2단계 진입 체크 시점 판별 : 미국 동부시간(ET) 평일 15:51 (미국 장 마감 10분 전, 썸머타임 자동 반영)
-    #    - 썸머타임 적용(EDT, UTC-4): 15:51 EDT = 19:51 UTC = 04:51 KST
-    #    - 썸머타임 해제(EST, UTC-5): 15:51 EST = 20:51 UTC = 05:51 KST
+    # 1. 일일 매수/매도2단계 진입 체크 시점 판별 : 미국 동부시간(ET) 평일 장 마감 10분 전 (정규장 15:51 / 조기폐장 12:51 ET, 썸머타임 자동 반영)
+    #    - 썸머타임 적용(EDT, UTC-4): 15:51 EDT = 19:51 UTC = 04:51 KST (조기폐장 12:51 EDT = 16:51 UTC = 01:51 KST)
+    #    - 썸머타임 해제(EST, UTC-5): 15:51 EST = 20:51 UTC = 05:51 KST (조기폐장 12:51 EST = 17:51 UTC = 02:51 KST)
     now_utc = datetime.now(timezone.utc)
     now_et = now_utc.astimezone(US_EASTERN)
     et_tz_name = now_et.tzname() or "ET"
-    target_utc_hour = (DAILY_CHECK_ET_HOUR - int(now_et.utcoffset().total_seconds() // 3600)) % 24
+    is_weekday = now_et.weekday() < 5                 # 미국 정규장 기준 월~금 (0~4)
+    check_et_hour = get_daily_check_et_hour(now_et) if is_weekday else None
+    disp_et_hour = check_et_hour if check_et_hour is not None else DAILY_CHECK_ET_HOUR
+    early_tag = " [조기폐장]" if (check_et_hour is not None and check_et_hour < DAILY_CHECK_ET_HOUR) else ""
+    target_utc_hour = (disp_et_hour - int(now_et.utcoffset().total_seconds() // 3600)) % 24
     target_kst_hour = (target_utc_hour + 9) % 24
     schedule_desc = (
-        f"평일 {DAILY_CHECK_ET_HOUR:02d}:{DAILY_CHECK_ET_MINUTE:02d} {et_tz_name} "
+        f"평일 {disp_et_hour:02d}:{DAILY_CHECK_ET_MINUTE:02d} {et_tz_name}{early_tag} "
         f"({target_utc_hour:02d}:{DAILY_CHECK_ET_MINUTE:02d} UTC / {target_kst_hour:02d}:{DAILY_CHECK_ET_MINUTE:02d} KST)"
     )
 
-    is_weekday = now_et.weekday() < 5                 # 미국 정규장 기준 월~금 (0~4)
-    is_buy_minute = (now_et.hour == DAILY_CHECK_ET_HOUR and now_et.minute == DAILY_CHECK_ET_MINUTE)
+    is_buy_minute = (check_et_hour is not None and now_et.hour == check_et_hour and now_et.minute == DAILY_CHECK_ET_MINUTE)
     force_buy = os.environ.get("FORCE_BUY_CHECK", "0") == "1"
     is_daily_buy_turn = (is_weekday and is_buy_minute) or force_buy
 
